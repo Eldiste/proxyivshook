@@ -7160,6 +7160,33 @@ dashboardButton.style.visibility =
             }
 
 
+            .tp9s-chart-axis-label-y {
+
+                fill: #6b6b6b;
+
+            }
+
+
+            .tp9s-chart-grid-line {
+
+                stroke: rgba(255,255,255,.07);
+
+                stroke-width: 1px;
+
+                stroke-dasharray: 3 5;
+
+            }
+
+
+            .tp9s-chart-grid-base {
+
+                stroke: rgba(255,255,255,.12);
+
+                stroke-dasharray: none;
+
+            }
+
+
             .tp9s-chart-hover {
 
                 opacity: 0;
@@ -8104,6 +8131,98 @@ dashboardButton.style.visibility =
     var CHART_PAD_X = 8;
     var CHART_PAD_TOP = 16;
 
+    // Marge gauche réservée aux graduations de l'axe vertical
+    // ("30 min", "2h", ...) : assez large pour le plus long libellé
+    // possible à 9.5px sans que le texte ne déborde du panneau.
+    var CHART_PAD_LEFT = 42;
+
+    // Paliers "ronds" candidats pour l'axe vertical : on retient le
+    // plus petit qui découpe le max de la période en ~4 graduations,
+    // pour ne jamais afficher de libellés du genre "47 min" ou
+    // "3h17" sur le côté.
+    var CHART_AXIS_STEPS_MS = [1, 2, 5, 10, 15, 30]
+        .map(function (min) {
+            return min * 60 * 1000;
+        })
+        .concat(
+            [1, 2, 3, 6, 12, 24, 48, 120, 240, 480, 1200, 2400, 4800]
+                .map(function (hours) {
+                    return hours * 60 * 60 * 1000;
+                })
+        );
+
+    var CHART_AXIS_TARGET_TICKS = 4;
+
+    // Libellé court pour l'axe : formatDuration() renverrait "1h00"
+    // là où "1h" suffit, et "0 min" là où un simple "0" est plus
+    // lisible au ras de la ligne de base.
+    function formatAxisDuration(ms) {
+
+        if (!ms) {
+            return '0';
+        }
+
+        if (ms < 60 * 60 * 1000) {
+            return Math.round(ms / 60000) + ' min';
+        }
+
+        var totalMinutes = Math.round(ms / 60000);
+
+        var hours = Math.floor(totalMinutes / 60);
+        var minutes = totalMinutes % 60;
+
+        if (!minutes) {
+            return hours + 'h';
+        }
+
+        return hours + 'h' + (minutes < 10 ? '0' : '') + minutes;
+
+    }
+
+    // Renvoie les graduations, de 0 jusqu'au premier palier rond
+    // au-dessus du max de la période. L'échelle suit donc la vague :
+    // elle est recalculée à chaque changement de filtre
+    // (24h / 7j / 30j / 1 an).
+    function buildWatchTimeAxisTicks(max) {
+
+        // Aucune donnée sur la période : on affiche quand même une
+        // échelle 0 -> 1h, sinon la grille se réduirait à une seule
+        // ligne et le graphique aurait l'air cassé.
+        var target = max > 0 ? max : 60 * 60 * 1000;
+
+        var rough = target / CHART_AXIS_TARGET_TICKS;
+
+        var step = CHART_AXIS_STEPS_MS[CHART_AXIS_STEPS_MS.length - 1];
+
+        for (var i = 0; i < CHART_AXIS_STEPS_MS.length; i++) {
+
+            if (CHART_AXIS_STEPS_MS[i] >= rough) {
+
+                step = CHART_AXIS_STEPS_MS[i];
+
+                break;
+
+            }
+
+        }
+
+        var top = Math.ceil(target / step) * step;
+
+        var ticks = [];
+
+        for (var value = 0; value <= top; value += step) {
+
+            ticks.push({
+                ms: value,
+                label: formatAxisDuration(value)
+            });
+
+        }
+
+        return ticks;
+
+    }
+
     // Redessine le graphique quand la largeur du conteneur change
     // (redimensionnement de fenêtre, ouverture/fermeture de la
     // sidebar, ...) : indispensable maintenant que le viewBox est
@@ -8184,14 +8303,12 @@ dashboardButton.style.visibility =
 
         var bottomPad = showLabels ? 22 : 10;
 
-        var innerW = chartWidth - CHART_PAD_X * 2;
+        var innerW = chartWidth - CHART_PAD_LEFT - CHART_PAD_X;
         var innerH = CHART_HEIGHT - CHART_PAD_TOP - bottomPad;
 
         var max = buckets.reduce(function (acc, b) {
             return Math.max(acc, b.ms);
         }, 0);
-
-        var safeMax = max || 1;
 
         if (!buckets.length) {
 
@@ -8201,13 +8318,21 @@ dashboardButton.style.visibility =
 
         }
 
+        // Le sommet de la vague n'est plus calé sur la valeur max
+        // brute (qui ne tombe presque jamais sur un palier lisible)
+        // mais sur la dernière graduation : c'est ce qui rend les
+        // libellés de gauche exploitables à l'oeil.
+        var axisTicks = buildWatchTimeAxisTicks(max);
+
+        var axisTop = axisTicks[axisTicks.length - 1].ms || 1;
+
         var points = buckets.map(function (b, i) {
 
             var x = buckets.length > 1
-                ? CHART_PAD_X + (innerW * i) / (buckets.length - 1)
-                : CHART_PAD_X + innerW / 2;
+                ? CHART_PAD_LEFT + (innerW * i) / (buckets.length - 1)
+                : CHART_PAD_LEFT + innerW / 2;
 
-            var y = CHART_PAD_TOP + innerH - (b.ms / safeMax) * innerH;
+            var y = CHART_PAD_TOP + innerH - (b.ms / axisTop) * innerH;
 
             return { x: x, y: y, ms: b.ms, label: b.label };
 
@@ -8222,6 +8347,28 @@ dashboardButton.style.visibility =
             ' L' + points[points.length - 1].x + ',' + baseline +
             ' L' + points[0].x + ',' + baseline +
             ' Z';
+
+        // Grille horizontale + graduations : dessinées en premier
+        // pour rester DERRIÈRE l'aire et la courbe.
+        var gridSVG = axisTicks.map(function (t) {
+
+            var y = Math.round(
+                (CHART_PAD_TOP + innerH - (t.ms / axisTop) * innerH) * 10
+            ) / 10;
+
+            return (
+                '<line class="tp9s-chart-grid-line' +
+                    (t.ms === 0 ? ' tp9s-chart-grid-base' : '') +
+                    '" x1="' + CHART_PAD_LEFT + '" y1="' + y +
+                    '" x2="' + (CHART_PAD_LEFT + innerW) + '" y2="' + y +
+                    '"></line>' +
+                '<text x="' + (CHART_PAD_LEFT - 8) + '" y="' + y +
+                    '" class="tp9s-chart-axis-label tp9s-chart-axis-label-y"' +
+                    ' text-anchor="end" dominant-baseline="middle">' +
+                    escapeHTML(t.label) + '</text>'
+            );
+
+        }).join('');
 
         var labelsSVG = showLabels
             ? points.map(function (p) {
@@ -8245,6 +8392,7 @@ dashboardButton.style.visibility =
                         '<stop offset="100%" stop-color="#9147ff"/>' +
                     '</linearGradient>' +
                 '</defs>' +
+                gridSVG +
                 '<path class="tp9s-chart-area" d="' + areaPath + '"></path>' +
                 '<path class="tp9s-chart-line" d="' + linePath + '"></path>' +
                 labelsSVG +
