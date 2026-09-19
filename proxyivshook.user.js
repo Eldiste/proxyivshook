@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.5.1
+// @version      1.5.2
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -32,7 +32,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.5.1';
+    var CURRENT_VERSION = '1.5.2';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -209,6 +209,32 @@
         var region = getProxyRegion(proxy);
 
         return (region && PROXY_REGION_META[region].accent) || '#9147ff';
+
+    }
+
+
+    // Le liseré gauche d'une ligne de proxy porte désormais son
+    // ÉTAT, et non plus sa région : celle-ci était déjà dite trois
+    // fois (le groupe, le drapeau, la couleur de l'avatar), tandis
+    // que l'état n'était lisible qu'en lisant le texte de chaque
+    // pastille, ligne par ligne.
+    //
+    // Quatre couleurs, pas une de plus : pas de nuance selon la
+    // latence, car l'ambre sert déjà à la quarantaine et deux sens
+    // pour une même couleur rendraient la lecture ambiguë.
+    function getProxyHealthColor(proxy) {
+
+        if (proxy.quarantine) {
+            return '#ffcf7a';
+        }
+
+        // Décoché : il ne court pas, il n'a donc aucun état à
+        // signaler — même gris que « jamais testé ».
+        if (!proxy.enabled || !proxy.lastTest) {
+            return '#6b6b73';
+        }
+
+        return proxy.lastTest.ok ? '#00d084' : '#ff6b6b';
 
     }
 
@@ -1590,6 +1616,13 @@
                 usage: pageStats.proxyUsage[proxy.id] || 0,
                 bandwidth: pageStats.bandwidthByProxy[proxy.id] || 0,
                 quarantined: !!proxy.quarantine,
+
+                // Même code couleur et même pictogramme que dans le
+                // menu : d'une surface à l'autre, un relais EU reste
+                // bleu et gardé son drapeau.
+                accent: getProxyAccent(proxy),
+                icon: getProxyIcon(proxy),
+
                 score: computeProxyScore(successRate, avgLatency)
             };
 
@@ -3916,6 +3949,10 @@
 
             </div>
 
+            <div class="tp9-test-progress">
+                <div class="tp9-test-progress-fill"></div>
+            </div>
+
 
             <div class="tp9-content">
 
@@ -3958,6 +3995,8 @@
     <span>📡 PROXYS</span>
     <span class="tp9-proxy-count"></span>
 </div>
+
+<div class="tp9-proxy-warning" style="display:none;"></div>
 
 <input
     type="text"
@@ -4604,23 +4643,44 @@ document.addEventListener(
         }
 
 
-        var enabledCount =
+        // Un proxy coche mais en quarantaine ne participe plus a la
+        // course (voir getRaceableProxies) : le compter parmi les
+        // « actifs » laissait croire qu'il tenait encore le flux.
+        var raceableCount = getRaceableProxies().length;
+
+        var quarantinedCount =
             pageConfig.proxies.filter(
                 function (p) {
-                    return p.enabled;
+                    return p.enabled && isQuarantined(p);
                 }
             ).length;
 
+        var countBadge =
+            dashboard.querySelector('.tp9-proxy-count');
 
-        dashboard
-            .querySelector(
-                '.tp9-proxy-count'
-            )
-            .textContent =
-            enabledCount +
-            ' / ' +
-            pageConfig.proxies.length +
-            ' actifs';
+        countBadge.textContent =
+            quarantinedCount
+                ? raceableCount + ' en course · ' + quarantinedCount + ' 💤'
+                : raceableCount +
+                    ' / ' +
+                    pageConfig.proxies.length +
+                    ' en course';
+
+        countBadge.setAttribute(
+            'data-tp9-tip',
+            raceableCount + ' proxy(s) en course'
+        );
+
+        countBadge.setAttribute(
+            'data-tp9-tip-sub',
+            'Sur ' + pageConfig.proxies.length + ' configurés' +
+            (quarantinedCount
+                ? ', dont ' + quarantinedCount +
+                    ' coché(s) mais en quarantaine, donc écarté(s) de la course.'
+                : '.')
+        );
+
+        renderProxyWarning(raceableCount);
 
 
         var searchField =
@@ -4635,6 +4695,56 @@ document.addEventListener(
         renderProxyList();
 
         renderDashboardSettings();
+
+    }
+
+
+    // Plus aucun proxy en course : le flux repartira chez Twitch
+    // (donc avec les pubs), ou echouera si le repli est coupe. Le
+    // menu ne le disait nulle part — seule une alerte au clic sur
+    // « Tester » le signalait, donc trop tard et au mauvais endroit.
+    function renderProxyWarning(raceableCount) {
+
+        var warning =
+            dashboard.querySelector('.tp9-proxy-warning');
+
+        if (!warning) {
+            return;
+        }
+
+        if (raceableCount > 0) {
+
+            warning.style.display = 'none';
+
+            return;
+
+        }
+
+        var enabledCount =
+            pageConfig.proxies.filter(
+                function (p) {
+                    return p.enabled;
+                }
+            ).length;
+
+        // Tout decoche et tout en quarantaine donnent le meme
+        // resultat, mais pas la meme chose a faire : on nomme la
+        // cause reelle plutot qu'un message unique et vague.
+        var cause = enabledCount
+            ? 'Tous les proxys activés sont en quarantaine'
+            : 'Aucun proxy activé';
+
+        var consequence = pageConfig.fallback
+            ? 'la lecture repassera par Twitch, pubs comprises.'
+            : 'le repli étant désactivé, la lecture échouera.';
+
+        warning.innerHTML =
+            '<span class="tp9-proxy-warning-icon">⚠️</span>' +
+            '<span>' +
+                escapeHTML(cause + ' : ' + consequence) +
+            '</span>';
+
+        warning.style.display = 'flex';
 
     }
 
@@ -4867,6 +4977,15 @@ document.addEventListener(
                 row.style.setProperty(
                     '--accent',
                     getProxyAccent(proxy)
+                );
+
+
+                // Variable distincte de --accent, qui reste la
+                // couleur de région : l'avatar et la case à cocher
+                // doivent continuer à la porter.
+                row.style.setProperty(
+                    '--health',
+                    getProxyHealthColor(proxy)
                 );
 
 
@@ -10137,6 +10256,45 @@ dashboardButton.style.visibility =
             }
 
 
+            .tp9-proxy-warning {
+
+                display: flex;
+
+                align-items: flex-start;
+
+                gap: 8px;
+
+                margin-bottom: 8px;
+
+                padding: 8px 10px;
+
+                border-radius: 8px;
+
+                background:
+                    linear-gradient(135deg,
+                        rgba(255,207,122,.18),
+                        rgba(255,207,122,.04));
+
+                border: 1px solid rgba(255,207,122,.32);
+
+                color: #ffcf7a;
+
+                font-size: 11px;
+
+                line-height: 1.45;
+
+            }
+
+
+            .tp9-proxy-warning-icon {
+
+                flex: 0 0 auto;
+
+                font-size: 12px;
+
+            }
+
+
             .tp9-empty {
 
                 padding: 14px 8px;
@@ -10192,6 +10350,266 @@ dashboardButton.style.visibility =
             @media (prefers-reduced-motion: reduce) {
 
                 .tp9-group-caret {
+
+                    transition: none;
+
+                }
+
+            }
+
+            /* =====================================================
+               FINITION — typo, santé, densité
+               -----------------------------------------------------
+               Écrit tout en fin de feuille, comme les blocs de
+               refonte précédents : à spécificité égale la dernière
+               règle gagne, donc celui-ci reprend la main sans qu'il
+               faille retoucher les règles d'origine.
+            ===================================================== */
+
+            /* ---- La même typo que le reste du site ----
+               Le menu était en Arial alors que le dashboard, le
+               bouton flottant et Twitch lui-même sont en Inter.
+               Champs et listes déroulantes ne l'héritent pas seuls,
+               d'où les deux sélecteurs explicites. */
+
+            #tp9-dashboard,
+            #tp9-toast {
+
+                font-family:
+                    "Inter",
+                    "Roobert",
+                    "Helvetica Neue",
+                    Helvetica,
+                    Arial,
+                    sans-serif;
+
+            }
+
+
+            .tp9-add-field input,
+            .tp9-select-field select {
+
+                font-family: inherit;
+
+            }
+
+
+            /* Sans chiffres à chasse fixe, une latence qui passe de
+               320 à 1180 ms élargit le nombre et fait sauter toute
+               la ligne sous le curseur. */
+
+            .tp9-status,
+            .tp9-test-time,
+            .tp9-proxy-count,
+            .tp9-group-count,
+            .tp9-hero-meta {
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            /* ---- Le liseré dit l'état, pas la région
+               (voir getProxyHealthColor) ---- */
+
+            .tp9-proxy::before {
+
+                background: var(--health, var(--accent));
+
+            }
+
+
+            /* ---- Le bouton dashboard reste bien visible, mais ne
+               vole plus la vedette à la carte de lecture : même
+               taille, même place, même violet — en contour plutôt
+               qu'en aplat. ---- */
+
+            .tp9-open-stats {
+
+                background:
+                    linear-gradient(135deg,
+                        rgba(145,71,255,.18),
+                        rgba(145,71,255,.05));
+
+                background-size: auto;
+
+                background-position: 0 0;
+
+                border: 1px solid rgba(145,71,255,.45);
+
+                color: #d9c2ff;
+
+                box-shadow: none;
+
+                transition:
+                    background-color .12s ease,
+                    border-color .12s ease,
+                    color .12s ease,
+                    box-shadow .15s ease,
+                    transform .12s ease;
+
+            }
+
+
+            .tp9-open-stats:hover {
+
+                background:
+                    linear-gradient(135deg,
+                        rgba(145,71,255,.34),
+                        rgba(145,71,255,.12));
+
+                background-position: 0 0;
+
+                border-color: rgba(145,71,255,.7);
+
+                color: #fff;
+
+                filter: none;
+
+                transform: var(--tp9-lift);
+
+                box-shadow: 0 5px 18px rgba(145,71,255,.28);
+
+            }
+
+
+            .tp9-open-stats:active {
+
+                transform: var(--tp9-press);
+
+                box-shadow: none;
+
+            }
+
+
+            /* ---- Les blocs, affirmés ----
+               Un fond à .028 sur un menu déjà translucide ne se
+               voyait pratiquement pas : ils occupaient du padding
+               sans rien structurer. */
+
+            .tp9-block {
+
+                margin-bottom: 8px;
+
+                padding: 9px 9px 7px;
+
+                background:
+                    linear-gradient(180deg,
+                        rgba(255,255,255,.065),
+                        rgba(255,255,255,.022));
+
+                border: 1px solid rgba(255,255,255,.09);
+
+                box-shadow:
+                    inset 0 1px 0 rgba(255,255,255,.05),
+                    0 2px 10px rgba(0,0,0,.22);
+
+            }
+
+
+            /* ---- Densité ----
+               Environ 8 px gagnés par ligne, soit une centaine sur
+               treize proxys dans un menu haut de 470 px. */
+
+            .tp9-proxy {
+
+                padding: 6px 9px 6px 11px;
+
+                margin-bottom: 5px;
+
+            }
+
+
+            .tp9-proxy-main {
+
+                gap: 8px;
+
+            }
+
+
+            .tp9-proxy-avatar {
+
+                width: 24px;
+                height: 24px;
+
+                border-radius: 8px;
+
+                font-size: 12px;
+
+            }
+
+
+            .tp9-enabled {
+
+                width: 14px;
+                height: 14px;
+
+            }
+
+
+            .tp9-status {
+
+                margin-top: 3px;
+
+                padding: 1px 6px;
+
+                font-size: 10px;
+
+            }
+
+
+            .tp9-unquarantine,
+            .tp9-delete {
+
+                width: 24px;
+                height: 24px;
+
+            }
+
+
+            /* ---- Avancement de la salve de tests ---- */
+
+            .tp9-test-progress {
+
+                height: 2px;
+
+                background: rgba(255,255,255,.06);
+
+                opacity: 0;
+
+                transition: opacity .2s ease;
+
+            }
+
+
+            .tp9-test-progress-on {
+
+                opacity: 1;
+
+            }
+
+
+            .tp9-test-progress-fill {
+
+                width: 0%;
+
+                height: 100%;
+
+                border-radius: 0 2px 2px 0;
+
+                background:
+                    linear-gradient(90deg, #bf94ff, #9147ff);
+
+                box-shadow: 0 0 8px rgba(145,71,255,.55);
+
+                transition: width .25s ease;
+
+            }
+
+
+            @media (prefers-reduced-motion: reduce) {
+
+                .tp9-test-progress-fill {
 
                     transition: none;
 
@@ -12411,32 +12829,6 @@ dashboardButton.style.visibility =
             }
 
 
-            .tp9s-bar-track {
-
-                height: 8px;
-
-                border-radius: 5px;
-
-                background: rgba(255,255,255,.06);
-
-                overflow: hidden;
-
-            }
-
-
-            .tp9s-bar-fill {
-
-                height: 100%;
-
-                border-radius: 5px;
-
-                background: linear-gradient(90deg, #bf94ff, #9147ff);
-
-                transition: width .5s ease;
-
-            }
-
-
             .tp9s-bar-value {
 
                 text-align: right;
@@ -13351,41 +13743,10 @@ dashboardButton.style.visibility =
             }
 
 
-            .tp9s-bar-dot {
-
-                flex: 0 0 auto;
-
-                width: 8px;
-                height: 8px;
-
-                border-radius: 50%;
-
-            }
-
-
-            .tp9s-bar-track {
-
-                background: rgba(255,255,255,.07);
-
-                box-shadow: inset 0 0 0 1px rgba(255,255,255,.04);
-
-            }
-
-
             /* --bar est posé sur la barre elle-même (voir
                renderStatsHabitudes) : le dégradé part d'une version
                éclaircie de la couleur du jour et y revient, ce qui
                garde du relief sans inventer une seconde teinte. */
-
-            .tp9s-bar-fill {
-
-                background:
-                    linear-gradient(90deg,
-                        color-mix(in srgb, var(--bar, #9147ff) 55%, #fff),
-                        var(--bar, #9147ff));
-
-            }
-
 
             /* =====================================================
                MODALE — HISTORIQUE DES MESSAGES
@@ -13921,13 +14282,6 @@ dashboardButton.style.visibility =
             }
 
 
-            .tp9s-weekday-row {
-
-                grid-template-columns: 112px 1fr 62px 46px;
-
-            }
-
-
             .tp9s-bar-label {
 
                 min-width: 0;
@@ -13957,55 +14311,11 @@ dashboardButton.style.visibility =
             }
 
 
-            .tp9s-bar-pct {
-
-                text-align: right;
-
-                color: #7e7e8a;
-
-                font-size: 11px;
-
-                font-variant-numeric: tabular-nums;
-
-            }
-
-
-            .tp9s-bar-track {
-
-                height: 9px;
-
-            }
-
-
             /* Un jour sans visionnage : la couleur du jour n'a plus
                rien à signaler, elle ne doit pas attirer l'œil. */
 
-            .tp9s-bar-empty .tp9s-bar-label,
-            .tp9s-bar-empty .tp9s-bar-value {
-
-                opacity: .4;
-
-            }
-
-
             /* Le jour le plus chargé se repère sans lire les
                chiffres. */
-
-            .tp9s-bar-top .tp9s-bar-label {
-
-                color: #fff;
-
-                font-weight: 700;
-
-            }
-
-
-            .tp9s-bar-top .tp9s-bar-fill {
-
-                box-shadow: 0 0 10px -2px var(--bar, #9147ff);
-
-            }
-
 
             /* Une carte non cliquable affichait le curseur « texte »
                (la barre en I) dès qu'on passait sur ses libellés :
@@ -14018,6 +14328,388 @@ dashboardButton.style.visibility =
             .tp9s-card:not(.tp9s-card-clickable) {
 
                 cursor: default;
+
+            }
+
+            /* =====================================================
+               LISIBILITÉ DES TABLEAUX
+               -----------------------------------------------------
+               Les deux tableaux affichaient jusqu'à huit colonnes
+               dans le même blanc et la même graisse : rien n'y
+               guidait l'œil, et le score n'était qu'un nombre nu
+               sans échelle. Trois outils seulement, pour ne pas
+               transformer un tableau en sapin de Noël : une pastille
+               colorée pour le score, une unité atténuée derrière
+               chaque nombre, et un gris pour les colonnes d'appoint.
+            ===================================================== */
+
+            /* Les colonnes de chiffres ne s'alignaient pas d'une
+               ligne à l'autre : sans chasse fixe, « 1180 » est plus
+               large que « 320 ». */
+
+            .tp9s-table-row,
+            .tp9s-lead-row {
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            .tp9s-unit {
+
+                margin-left: 2px;
+
+                font-size: .85em;
+
+                font-weight: 600;
+
+                opacity: .5;
+
+            }
+
+
+            .tp9s-td-dim {
+
+                color: #86868f;
+
+            }
+
+
+            .tp9s-td-strong {
+
+                color: #fff;
+
+                font-weight: 700;
+
+            }
+
+
+            /* La pastille répond aux deux questions que posait le
+               nombre nu : sur quelle échelle, et dans quel sens. */
+
+            .tp9s-score-badge {
+
+                display: inline-flex;
+
+                align-items: center;
+
+                justify-content: center;
+
+                min-width: 34px;
+
+                padding: 2px 8px;
+
+                border-radius: 999px;
+
+                background:
+                    color-mix(in srgb, var(--tone) 18%, transparent);
+
+                box-shadow:
+                    inset 0 0 0 1px
+                    color-mix(in srgb, var(--tone) 32%, transparent);
+
+                color: var(--tone);
+
+                font-size: 11.5px;
+
+                font-weight: 800;
+
+                cursor: help;
+
+            }
+
+
+            /* Le proxy principal d'un streamer était du texte comme
+               le reste : en étiquette teintée de sa région, on le
+               relie d'un coup d'œil au menu et au tableau Proxys. */
+
+            .tp9s-tag {
+
+                display: inline-flex;
+
+                align-items: center;
+
+                gap: 5px;
+
+                max-width: 100%;
+
+                padding: 2px 9px;
+
+                border-radius: 999px;
+
+                background:
+                    color-mix(in srgb, var(--tone, #9147ff) 16%, transparent);
+
+                box-shadow:
+                    inset 0 0 0 1px
+                    color-mix(in srgb, var(--tone, #9147ff) 28%, transparent);
+
+                color:
+                    color-mix(in srgb, var(--tone, #9147ff) 65%, #fff);
+
+                font-size: 11px;
+
+                font-weight: 700;
+
+                white-space: nowrap;
+
+                overflow: hidden;
+
+                text-overflow: ellipsis;
+
+            }
+
+
+            /* Les pastilles de région du tableau Proxys : le dégradé
+               d'origine partait vers un violet unique, qui écrasait
+               justement la couleur qu'on vient d'y mettre. */
+
+            .tp9s-table-row-relais .tp9s-avatar {
+
+                background:
+                    linear-gradient(135deg,
+                        color-mix(in srgb, var(--accent) 34%, transparent),
+                        color-mix(in srgb, var(--accent) 12%, transparent));
+
+                box-shadow:
+                    inset 0 0 0 1px
+                    color-mix(in srgb, var(--accent) 40%, transparent);
+
+                font-size: 12px;
+
+            }
+
+            /* =====================================================
+               HABITUDES — frise des sessions, semaine en colonnes
+               -----------------------------------------------------
+               Deux graphiques qui ne disaient rien :
+
+               - les sessions étaient des barres à l'échelle de la
+                 plus longue, donc la première ligne était toujours
+                 pleine par construction, et des longueurs qui
+                 varient sur des lignes chronologiques se lisaient
+                 comme un classement inexistant ;
+               - la semaine était sept lignes à parcourir une par
+                 une, là où sept colonnes se lisent d'un regard.
+            ===================================================== */
+
+            /* ---- frise horaire ---- */
+
+            .tp9s-time-head {
+
+                padding-bottom: 2px;
+
+            }
+
+
+            .tp9s-time-axis {
+
+                display: flex;
+
+                justify-content: space-between;
+
+                font-size: 9.5px;
+
+                font-variant-numeric: tabular-nums;
+
+                color: #6f6f7a;
+
+            }
+
+
+            /* Un trait tous les quart de journée (0h, 6h, 12h, 18h) :
+               assez pour situer « matin » ou « soir » sans quadriller
+               la bande de vingt-quatre barreaux. */
+
+            .tp9s-time-track {
+
+                position: relative;
+
+                height: 14px;
+
+                border-radius: 5px;
+
+                background:
+                    repeating-linear-gradient(90deg,
+                        rgba(255,255,255,.09) 0 1px,
+                        transparent 1px 25%),
+                    rgba(255,255,255,.045);
+
+                box-shadow: inset 0 0 0 1px rgba(255,255,255,.04);
+
+            }
+
+
+            .tp9s-time-seg {
+
+                position: absolute;
+
+                top: 2px;
+                bottom: 2px;
+
+                min-width: 3px;
+
+                border-radius: 4px;
+
+                background:
+                    linear-gradient(90deg,
+                        color-mix(in srgb, var(--bar, #9147ff) 58%, #fff),
+                        var(--bar, #9147ff));
+
+                box-shadow: 0 0 9px -2px var(--bar, #9147ff);
+
+                transition: filter .12s ease;
+
+            }
+
+
+            .tp9s-time-seg:hover {
+
+                filter: brightness(1.18);
+
+            }
+
+
+            /* ---- semaine en colonnes ---- */
+
+            .tp9s-week-chart {
+
+                display: grid;
+
+                grid-template-columns: repeat(7, minmax(0, 1fr));
+
+                gap: 10px;
+
+                align-items: end;
+
+                padding-top: 4px;
+
+            }
+
+
+            .tp9s-week-col {
+
+                display: flex;
+
+                flex-direction: column;
+
+                align-items: center;
+
+                gap: 7px;
+
+                min-width: 0;
+
+            }
+
+
+            .tp9s-week-value {
+
+                font-size: 11.5px;
+
+                font-weight: 700;
+
+                font-variant-numeric: tabular-nums;
+
+                white-space: nowrap;
+
+            }
+
+
+            .tp9s-week-bar-wrap {
+
+                display: flex;
+
+                align-items: flex-end;
+
+                width: 100%;
+
+                height: 132px;
+
+            }
+
+
+            .tp9s-week-bar {
+
+                width: 100%;
+
+                min-height: 3px;
+
+                border-radius: 6px 6px 3px 3px;
+
+                background:
+                    linear-gradient(180deg,
+                        color-mix(in srgb, var(--bar, #9147ff) 62%, #fff),
+                        var(--bar, #9147ff));
+
+                transition: height .5s ease, filter .12s ease;
+
+            }
+
+
+            .tp9s-week-col:hover .tp9s-week-bar {
+
+                filter: brightness(1.15);
+
+            }
+
+
+            .tp9s-week-day {
+
+                font-size: 11px;
+
+                font-weight: 600;
+
+                color: #9a9aa3;
+
+            }
+
+
+            /* Le jour le plus chargé se repère sans lire les
+               chiffres. */
+
+            .tp9s-week-top .tp9s-week-day {
+
+                color: #fff;
+
+                font-weight: 700;
+
+            }
+
+
+            .tp9s-week-top .tp9s-week-bar {
+
+                box-shadow: 0 0 12px -2px var(--bar, #9147ff);
+
+            }
+
+
+            /* Un jour sans visionnage : sa couleur n'a plus rien à
+               signaler, elle ne doit pas attirer l'œil. */
+
+            .tp9s-week-empty .tp9s-week-value,
+            .tp9s-week-empty .tp9s-week-day {
+
+                opacity: .38;
+
+            }
+
+
+            .tp9s-week-empty .tp9s-week-bar {
+
+                background: rgba(255,255,255,.08);
+
+                box-shadow: none;
+
+            }
+
+
+            @media (prefers-reduced-motion: reduce) {
+
+                .tp9s-week-bar {
+
+                    transition: none;
+
+                }
 
             }
 
@@ -14981,6 +15673,9 @@ dashboardButton.style.visibility =
     var MONTH_LABELS_ABBR_DOT = ['Janv.', 'Févr.', 'Mars', 'Avr.', 'Mai', 'Juin', 'Juil.', 'Août', 'Sept.', 'Oct.', 'Nov.', 'Déc.'];
     var DAY_LABELS_FULL = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
 
+    // Sous une colonne de graphique, « Mercredi » ne tient pas.
+    var DAY_LABELS_SHORT = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
+
     var STATS_WATCH_RANGES = [
         { id: '24h', label: '24h' },
         { id: '7', label: '7 jours' },
@@ -15410,7 +16105,7 @@ dashboardButton.style.visibility =
     var STATS_CHART_METRICS = {
 
         watch: {
-            title: 'Temps de visionnage',
+            title: '🕒 Temps de visionnage',
             button: '🕒 Temps',
             daily: 'dailyWatchTime',
             hourly: 'hourlyWatchTime',
@@ -15430,7 +16125,7 @@ dashboardButton.style.visibility =
         // mauvaise, logs, suppression), une simple mesure de
         // volume s'y lirait comme une alerte.
         bandwidth: {
-            title: 'Bande passante',
+            title: '📶 Bande passante',
             button: '📶 Données',
             daily: 'dailyBandwidth',
             hourly: 'hourlyBandwidth',
@@ -15988,7 +16683,7 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
                     <div>
-                        <div class="tp9s-panel-title">Meilleurs proxys (7 jours)</div>
+                        <div class="tp9s-panel-title">🏆 Meilleurs proxys (7 jours)</div>
                         <div class="tp9s-panel-sub">Score combinant le taux de réussite et la latence moyenne</div>
                     </div>
                     <button type="button" class="tp9s-panel-link" data-nav="relais">Voir tous les proxys →</button>
@@ -16146,6 +16841,65 @@ dashboardButton.style.visibility =
 
     }
 
+    // Sépare le nombre de son unité pour pouvoir atténuer la
+    // seconde : à luminosité égale, « 3.2 Go » se lit moins vite
+    // que « 3.2 » suivi d'un « Go » plus discret. Réservé aux
+    // valeurs du type « 420 ms » / « 3.2 Go » — surtout pas aux
+    // durées, où « 1h30 » serait coupé n'importe où.
+    function withUnit(text) {
+
+        var parts = String(text).match(/^([\d.,]+)\s*(.*)$/);
+
+        if (!parts || !parts[2]) {
+            return escapeHTML(String(text));
+        }
+
+        return (
+            escapeHTML(parts[1]) +
+            '<span class="tp9s-unit">' + escapeHTML(parts[2]) + '</span>'
+        );
+
+    }
+
+    // Le score n'était qu'un nombre nu : rien ne disait sur quelle
+    // échelle il se lit, ni si un grand chiffre est bon. Une pastille
+    // colorée par palier répond aux deux d'un coup d'œil.
+    function scoreTone(score) {
+
+        if (score === null) return '#777';
+        if (score >= 80) return '#00d084';
+        if (score >= 55) return '#ffcf7a';
+
+        return '#ff6b6b';
+
+    }
+
+    function scoreLabel(score) {
+
+        if (score >= 80) return 'excellent';
+        if (score >= 55) return 'correct';
+
+        return 'faible';
+
+    }
+
+    // « positif = plus lent en vrai » demandait de retenir une
+    // convention de signe pour lire une carte. Une phrase entière
+    // coûte le même espace et ne se déchiffre pas.
+    function describeLatencyGap(gapMs) {
+
+        if (!gapMs) {
+            return 'aussi rapide en lecture qu\'aux tests';
+        }
+
+        return (
+            Math.abs(gapMs) + ' ms plus ' +
+            (gapMs > 0 ? 'lent' : 'rapide') +
+            ' en lecture qu\'aux tests'
+        );
+
+    }
+
     // ------------------------------------------------------------
     // TRI DES TABLEAUX "RELAIS" / "STREAMERS" (en-têtes cliquables)
     // ------------------------------------------------------------
@@ -16185,7 +16939,7 @@ dashboardButton.style.visibility =
 
     // En-tête de colonne cliquable, avec petite flèche indiquant le
     // sens quand c'est la colonne triée actuellement.
-    function sortableHeaderHTML(label, table, key, activeKey, activeDir) {
+    function sortableHeaderHTML(label, table, key, activeKey, activeDir, tip, tipSub) {
 
         var isActive = key === activeKey;
 
@@ -16193,9 +16947,18 @@ dashboardButton.style.visibility =
             ? '<span class="tp9s-sort-arrow">' + (activeDir === 'asc' ? '▲' : '▼') + '</span>'
             : '';
 
+        // Une colonne dont le libellé ne suffit pas (Score, et les
+        // deux latences qui ne mesurent pas la même chose) peut
+        // s'expliquer là où on se pose la question : sur son titre.
+        var tipAttrs = tip
+            ? ' data-tp9-tip="' + escapeHTML(tip) + '"' +
+                (tipSub ? ' data-tp9-tip-sub="' + escapeHTML(tipSub) + '"' : '')
+            : '';
+
         return (
             '<div class="tp9s-td tp9s-sortable' + (isActive ? ' tp9s-sort-active' : '') + '"' +
-                ' data-sort-table="' + table + '" data-sort-key="' + key + '">' +
+                ' data-sort-table="' + table + '" data-sort-key="' + key + '"' +
+                tipAttrs + '>' +
                 escapeHTML(label) + arrow +
             '</div>'
         );
@@ -16341,7 +17104,7 @@ dashboardButton.style.visibility =
                     ? '—'
                     : (gapMs > 0 ? '+' : '') + gapMs + ' ms',
                 gapProxy
-                    ? gapProxy.name + ' · positif = plus lent en vrai'
+                    ? gapProxy.name + ' : ' + describeLatencyGap(gapMs)
                     : 'il faut les deux mesures sur un même proxy',
                 '#4fc3f7'
             )
@@ -16356,7 +17119,9 @@ dashboardButton.style.visibility =
                 '<div class="tp9s-table-row tp9s-table-row-relais">' +
                     '<div class="tp9s-td tp9s-td-rank">' + sortRankHTML(index) + '</div>' +
                     '<div class="tp9s-td tp9s-td-name-flex">' +
-                        '<div class="tp9s-avatar">' + initialLetter(p.name) + '</div>' +
+                        '<div class="tp9s-avatar" style="--accent:' + p.accent + '">' +
+                            p.icon +
+                        '</div>' +
                         '<span>' + escapeHTML(p.name) + '</span>' +
                         (
                             p.quarantined
@@ -16368,30 +17133,49 @@ dashboardButton.style.visibility =
                         ) +
                     '</div>' +
                     '<div class="tp9s-td tp9s-td-score">' +
-                        (p.score !== null ? p.score : '—') +
+                        (
+                            p.score !== null
+                                ? '<span class="tp9s-score-badge" style="--tone:' +
+                                    scoreTone(p.score) + '"' +
+                                    ' data-tp9-tip="Score ' + p.score + ' / 100 · ' +
+                                    scoreLabel(p.score) + '"' +
+                                    ' data-tp9-tip-sub="' + p.successRate +
+                                    ' % de réussite et ' + p.avgLatency +
+                                    ' ms de latence moyenne. Le score part du taux de' +
+                                    ' réussite et le rabote à mesure que la latence' +
+                                    ' dépasse 300 ms.">' +
+                                    p.score +
+                                  '</span>'
+                                : '<span class="tp9s-td-dim">—</span>'
+                        ) +
                     '</div>' +
                     '<div class="tp9s-td tp9s-td-latency" style="color:' + latencyColor(p.avgLatency) + ';">' +
                         '<span>' +
-                            (p.avgLatency !== null ? p.avgLatency + ' ms' : '—') +
+                            (p.avgLatency !== null ? withUnit(p.avgLatency + ' ms') : '—') +
                         '</span>' +
                         sparklineSVG(p.latencySeries, latencyColor(p.avgLatency)) +
                     '</div>' +
                     '<div class="tp9s-td tp9s-td-live" style="color:' + latencyColor(p.liveLatency) + ';">' +
-                        (p.liveLatency !== null ? p.liveLatency + ' ms' : '—') +
+                        (p.liveLatency !== null ? withUnit(p.liveLatency + ' ms') : '—') +
                     '</div>' +
                     '<div class="tp9s-td tp9s-td-flex">' +
                         (
                             p.successRate !== null
                                 ? '<span class="tp9s-progress ' + rateCls + '">' +
                                     '<span class="tp9s-progress-fill" style="width:' + p.successRate + '%"></span>' +
-                                  '</span>' + p.successRate + '%'
-                                : '—'
+                                  '</span>' + p.successRate +
+                                  '<span class="tp9s-unit">%</span>'
+                                : '<span class="tp9s-td-dim">—</span>'
                         ) +
                     '</div>' +
-                    '<div class="tp9s-td">' + p.testCount + '</div>' +
-                    '<div class="tp9s-td">' + p.usage + '</div>' +
-                    '<div class="tp9s-td">' +
-                        formatBytes(p.bandwidth) +
+
+                    // Colonnes d'appoint : atténuées, pour que l'œil
+                    // tombe sur le nom et le score plutôt que sur
+                    // huit nombres de même valeur visuelle.
+                    '<div class="tp9s-td tp9s-td-dim">' + p.testCount + '</div>' +
+                    '<div class="tp9s-td tp9s-td-dim">' + p.usage + '</div>' +
+                    '<div class="tp9s-td tp9s-td-dim">' +
+                        withUnit(formatBytes(p.bandwidth)) +
                     '</div>' +
                 '</div>'
             );
@@ -16403,7 +17187,7 @@ dashboardButton.style.visibility =
             <div class="tp9s-cards">${proxyCards}</div>
 
             <div class="tp9s-panel">
-                <div class="tp9s-panel-title">Classement des proxys</div>
+                <div class="tp9s-panel-title">📡 Classement des proxys</div>
                 <div class="tp9s-panel-sub">
                     Score = réussite pondérée par la latence, sur les 7 derniers jours ·
                     « latence test » = mesurée par les tests automatiques, « latence réelle » =
@@ -16414,9 +17198,15 @@ dashboardButton.style.visibility =
                     <div class="tp9s-table-row tp9s-table-row-relais tp9s-table-head">
                         <div class="tp9s-td"></div>
                         <div class="tp9s-td tp9s-td-name">Proxy</div>
-                        ${sortableHeaderHTML('Score', 'relais', 'score', key, dir)}
-                        ${sortableHeaderHTML('Latence test', 'relais', 'avgLatency', key, dir)}
-                        ${sortableHeaderHTML('Latence réelle', 'relais', 'liveLatency', key, dir)}
+                        ${sortableHeaderHTML('Score', 'relais', 'score', key, dir,
+                            'Score sur 100 · plus il est haut, mieux c\'est',
+                            'Part du taux de réussite sur 7 jours, puis le rabote à mesure que la latence moyenne dépasse 300 ms. Un relais rapide mais absent une fois sur trois ne vaut pas mieux qu\'un relais un peu plus lent mais toujours là.')}
+                        ${sortableHeaderHTML('Latence test', 'relais', 'avgLatency', key, dir,
+                            'Latence des tests provoqués',
+                            'Moyenne des tests que le script lance lui-même (bouton Tester, re-test automatique) sur les 7 derniers jours.')}
+                        ${sortableHeaderHTML('Latence réelle', 'relais', 'liveLatency', key, dir,
+                            'Latence subie pendant la lecture',
+                            'Temps réellement mis par ce relais pour rendre un manifest valide quand il a gagné la course, pendant que tu regardais.')}
                         ${sortableHeaderHTML('Réussite', 'relais', 'successRate', key, dir)}
                         ${sortableHeaderHTML('Tests 7j', 'relais', 'testCount', key, dir)}
                         ${sortableHeaderHTML('Utilisations', 'relais', 'usage', key, dir)}
@@ -16592,23 +17382,36 @@ dashboardButton.style.visibility =
                         avatarHTML +
                         '<span>' + escapeHTML(displayName) + '</span>' +
                     '</div>' +
-                    '<div class="tp9s-td">' + formatDuration(s.watchTimeMs) + '</div>' +
+                    // La colonne qui porte le classement par défaut :
+                    // c'est elle qu'on vient lire, elle ne doit pas
+                    // avoir le même poids que le reste de la ligne.
+                    '<div class="tp9s-td tp9s-td-strong">' +
+                        escapeHTML(formatDuration(s.watchTimeMs)) +
+                    '</div>' +
                     '<div class="tp9s-td">' +
                         (
                             s.chatMessages > 0
                                 ? '<button type="button" class="tp9s-msg-count" data-channel="' +
                                     escapeHTML(channel) + '">' + s.chatMessages + '</button>'
-                                : s.chatMessages
+                                : '<span class="tp9s-td-dim">' + s.chatMessages + '</span>'
                         ) +
                     '</div>' +
-                    '<div class="tp9s-td tp9s-td-flex">' +
+                    '<div class="tp9s-td tp9s-td-flex tp9s-td-dim">' +
                         '<span class="tp9s-progress">' +
                             '<span class="tp9s-progress-fill" style="width:' + bwPercent + '%;background:' + avatarColor + '"></span>' +
                         '</span>' +
-                        formatBytes(s.bandwidthBytes) +
+                        withUnit(formatBytes(s.bandwidthBytes)) +
                     '</div>' +
                     '<div class="tp9s-td">' +
-                        (proxyObj ? escapeHTML(proxyObj.name) : '—') +
+                        (
+                            proxyObj
+                                ? '<span class="tp9s-tag" style="--tone:' +
+                                    getProxyAccent(proxyObj) + '">' +
+                                    getProxyIcon(proxyObj) + ' ' +
+                                    escapeHTML(proxyObj.name) +
+                                  '</span>'
+                                : '<span class="tp9s-td-dim">—</span>'
+                        ) +
                     '</div>' +
                     '<div class="tp9s-td">' +
                         '<button type="button" class="tp9s-streamer-delete"' +
@@ -16631,7 +17434,7 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
                     <div>
-                        <div class="tp9s-panel-title">Streamers suivis</div>
+                        <div class="tp9s-panel-title">🎥 Streamers suivis</div>
                         <div class="tp9s-panel-sub">
                             Temps de visionnage, tes messages tchat et bande passante par streamer ·
                             clique un en-tête pour trier, ou sur le nombre de messages pour voir l'historique
@@ -16779,6 +17582,9 @@ dashboardButton.style.visibility =
 
     // Lundi en premier (getDay() renvoie 0 pour dimanche).
     var HEATMAP_DAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+
+    // Échelle de la frise horaire des sessions.
+    var MINUTES_PER_DAY = 24 * 60;
 
     // Une couleur par jour : sept barres du même violet ne se
     // distinguaient que par leur longueur, et l'œil devait faire
@@ -17141,30 +17947,73 @@ dashboardButton.style.visibility =
 
         // ---- répartition par jour de semaine (historique complet) ----
 
+        // La barre ne compare plus chaque session à la plus longue :
+        // cette référence était inutilisable (la première ligne ÉTAIT
+        // la plus longue, donc toujours pleine), et des barres de
+        // longueurs décroissantes sur des lignes chronologiques se
+        // lisaient comme un classement qui n'en était pas un.
+        //
+        // Elle est devenue une frise : la POSITION donne l'heure de
+        // début sur la journée, la LONGUEUR la durée. On lit donc
+        // d'un coup d'œil « je regarde le soir » — ce qui est très
+        // exactement le sujet de cet onglet.
         var sessionRows = (sessionStats.recent || []).map(function (s) {
 
-            var percent = (sessionStats.longest && sessionStats.longest.ms)
-                ? Math.max(4, Math.round((s.ms / sessionStats.longest.ms) * 100))
-                : 0;
+            var startDate = new Date(s.start);
+
+            var startMin =
+                startDate.getHours() * 60 + startDate.getMinutes();
+
+            // L'étendue réelle (début → fin), et non s.ms : c'est
+            // elle que la plage horaire affichée à côté annonce. Les
+            // deux diffèrent quand la lecture a été mise en pause au
+            // milieu du bloc.
+            var spanMin = Math.max(1, Math.round((s.end - s.start) / 60000));
+
+            // Une session qui passe minuit donnerait une largeur
+            // négative : on la coupe à la fin de la journée.
+            var visibleMin = Math.min(spanMin, MINUTES_PER_DAY - startMin);
+
+            var leftPct = (startMin / MINUTES_PER_DAY) * 100;
+
+            // Plancher de largeur : sans lui, une session d'une
+            // minute ne dessinerait rien du tout.
+            var widthPct = Math.max(
+                0.7,
+                (visibleMin / MINUTES_PER_DAY) * 100
+            );
 
             // Même code couleur que la répartition par jour de la
             // semaine juste en dessous : d'un panneau à l'autre, un
-            // mardi reste bleu.
-            var color = WEEKDAY_COLORS[new Date(s.start).getDay()];
+            // mardi reste bleu. La pastille, elle, a disparu — la
+            // date était écrite juste à côté, la couleur travaille
+            // mieux dans le segment lui-même.
+            var color = WEEKDAY_COLORS[startDate.getDay()];
 
             return (
                 '<div class="tp9s-bar-row tp9s-session-row">' +
                     '<div class="tp9s-bar-label">' +
-                        '<span class="tp9s-bar-dot" style="background:' + color + '"></span>' +
                         escapeHTML(formatSessionDay(s.start)) +
                     '</div>' +
                     '<div class="tp9s-bar-range">' +
                         escapeHTML(formatClock(s.start)) + ' → ' +
                         escapeHTML(formatClock(s.end)) +
                     '</div>' +
-                    '<div class="tp9s-bar-track">' +
-                        '<div class="tp9s-bar-fill" style="width:' + percent +
-                            '%;--bar:' + color + '"></div>' +
+                    '<div class="tp9s-time-track">' +
+                        '<div class="tp9s-time-seg"' +
+                            ' style="left:' + leftPct +
+                            '%;width:' + widthPct +
+                            '%;--bar:' + color + '"' +
+                            ' data-tp9-tip="' +
+                            escapeHTML(
+                                formatSessionDay(s.start) + ' · ' +
+                                formatClock(s.start) + ' → ' +
+                                formatClock(s.end)
+                            ) + '"' +
+                            ' data-tp9-tip-sub="' +
+                            escapeHTML(
+                                formatDuration(s.ms) + ' de visionnage'
+                            ) + '"></div>' +
                     '</div>' +
                     '<div class="tp9s-bar-value" style="color:' + color + '">' +
                         escapeHTML(formatDuration(s.ms)) +
@@ -17184,16 +18033,22 @@ dashboardButton.style.visibility =
             return acc + ms;
         }, 0);
 
+        // Sept jours dans un ordre naturel : c'est le cas d'école de
+        // l'histogramme en colonnes, qui se lit comme UNE SEMAINE
+        // d'un seul regard. En lignes, chaque jour occupait une
+        // bande de quatre colonnes qu'il fallait parcourir une par
+        // une — et l'empilement mangeait toute la hauteur du
+        // panneau.
+        //
+        // Le pourcentage part dans l'infobulle : en vertical, la
+        // comparaison des hauteurs le donne déjà à l'œil, l'afficher
+        // en plus ne ferait que charger.
         var weekdayRows = HEATMAP_DAY_ORDER.map(function (day) {
 
             var ms = weekdayTotals[day];
 
-            var percent = weekdayMax ? Math.round((ms / weekdayMax) * 100) : 0;
+            var percent = weekdayMax ? (ms / weekdayMax) * 100 : 0;
 
-            // Les barres sont à l'échelle du jour le plus chargé :
-            // quand tous les jours se ressemblent, elles paraissent
-            // toutes pleines et ne disent plus rien. La part du
-            // total, elle, donne le point de repère qui manquait.
             var share = weekdayTotal
                 ? Math.round((ms / weekdayTotal) * 100)
                 : 0;
@@ -17201,23 +18056,27 @@ dashboardButton.style.visibility =
             var color = WEEKDAY_COLORS[day];
 
             return (
-                '<div class="tp9s-bar-row tp9s-weekday-row' +
-                        (ms ? '' : ' tp9s-bar-empty') +
-                        (ms && ms === weekdayMax ? ' tp9s-bar-top' : '') +
-                        '">' +
-                    '<div class="tp9s-bar-label">' +
-                        '<span class="tp9s-bar-dot" style="background:' + color + '"></span>' +
-                        escapeHTML(DAY_LABELS_FULL[day]) +
-                    '</div>' +
-                    '<div class="tp9s-bar-track">' +
-                        '<div class="tp9s-bar-fill" style="width:' + percent +
-                            '%;--bar:' + color + '"></div>' +
-                    '</div>' +
-                    '<div class="tp9s-bar-value" style="color:' + color + '">' +
+                '<div class="tp9s-week-col' +
+                        (ms ? '' : ' tp9s-week-empty') +
+                        (ms && ms === weekdayMax ? ' tp9s-week-top' : '') +
+                        '"' +
+                    ' data-tp9-tip="' + escapeHTML(DAY_LABELS_FULL[day]) + '"' +
+                    ' data-tp9-tip-sub="' +
+                    escapeHTML(
+                        ms
+                            ? formatDuration(ms) + ' cumulées · ' + share +
+                                ' % de ton temps de visionnage'
+                            : 'aucun visionnage enregistré ce jour-là'
+                    ) + '">' +
+                    '<div class="tp9s-week-value" style="color:' + color + '">' +
                         escapeHTML(formatDuration(ms)) +
                     '</div>' +
-                    '<div class="tp9s-bar-pct">' +
-                        (ms ? share + ' %' : '—') +
+                    '<div class="tp9s-week-bar-wrap">' +
+                        '<div class="tp9s-week-bar" style="height:' + percent +
+                            '%;--bar:' + color + '"></div>' +
+                    '</div>' +
+                    '<div class="tp9s-week-day">' +
+                        escapeHTML(DAY_LABELS_SHORT[day]) +
                     '</div>' +
                 '</div>'
             );
@@ -17229,7 +18088,7 @@ dashboardButton.style.visibility =
             <div class="tp9s-cards">${cards}</div>
 
             <div class="tp9s-panel">
-                <div class="tp9s-panel-title">Carte de tes sessions</div>
+                <div class="tp9s-panel-title">🔥 Carte de tes sessions</div>
                 <div class="tp9s-panel-sub">
                     Chaque case = une heure de la semaine, plus elle est violette plus tu
                     regardes à ce moment-là · survole une case pour le détail
@@ -17245,33 +18104,37 @@ dashboardButton.style.visibility =
             </div>
 
             <div class="tp9s-panel">
-                <div class="tp9s-panel-title">Dernières sessions</div>
+                <div class="tp9s-panel-title">🕒 Dernières sessions</div>
                 <div class="tp9s-panel-sub">
-                    Tes 10 derniers blocs de visionnage continu · la barre compare
-                    chacun à ta plus longue session (${escapeHTML(
-                        sessionStats.longest
-                            ? formatDuration(sessionStats.longest.ms)
-                            : '—'
-                    )})
+                    Tes 10 derniers blocs de visionnage continu, placés sur la journée :
+                    la position de la barre donne l'heure, sa longueur la durée
                 </div>
 
                 ${
-                    sessionRows ||
-                    '<div class="tp9s-empty">Aucune session enregistrée pour le moment.</div>'
+                    sessionRows
+                        ? '<div class="tp9s-bar-row tp9s-session-row tp9s-time-head">' +
+                              '<div></div><div></div>' +
+                              '<div class="tp9s-time-axis">' +
+                                  '<span>0h</span><span>6h</span><span>12h</span>' +
+                                  '<span>18h</span><span>24h</span>' +
+                              '</div>' +
+                              '<div></div>' +
+                          '</div>' + sessionRows
+                        : '<div class="tp9s-empty">Aucune session enregistrée pour le moment.</div>'
                 }
             </div>
 
             <div class="tp9s-panel">
-                <div class="tp9s-panel-title">Répartition par jour de la semaine</div>
+                <div class="tp9s-panel-title">📅 Répartition par jour de la semaine</div>
                 <div class="tp9s-panel-sub">
                     ${escapeHTML(formatDuration(weekdayTotal))} au total sur tout
-                    l'historique conservé (jusqu'à un an) · la barre compare au jour
-                    le plus chargé, le pourcentage donne la part du total
+                    l'historique conservé (jusqu'à un an) · survole une colonne pour
+                    le détail et sa part du total
                 </div>
 
                 ${
                     weekdayMax
-                        ? weekdayRows
+                        ? '<div class="tp9s-week-chart">' + weekdayRows + '</div>'
                         : '<div class="tp9s-empty">Aucun historique de visionnage pour le moment.</div>'
                 }
             </div>
@@ -17836,7 +18699,7 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
                     <div>
-                        <div class="tp9s-panel-title">Journal des événements</div>
+                        <div class="tp9s-panel-title">📄 Journal des événements</div>
                         <div class="tp9s-panel-sub tp9s-log-count">${escapeHTML(logCountLabel(entries.length))}</div>
                     </div>
                     <button type="button" class="tp9s-clear-logs">${trashIconSVG(13)} Vider les logs</button>
@@ -18154,9 +19017,84 @@ dashboardButton.style.visibility =
     // salve complète à la logique de quarantaine (qui a besoin de
     // voir TOUS les résultats d'un coup pour savoir si la salve
     // était concluante).
+    // ------------------------------------------------------------
+    // AVANCEMENT DE LA SALVE DE TESTS
+    // ------------------------------------------------------------
+    //
+    // Jusqu'ici, le seul retour pendant un test était le « 🟡
+    // test... » qui traversait les lignes une à une : impossible de
+    // savoir où on en était dans la salve, ni combien il restait.
+    // Une barre de 2 px sous l'en-tête le dit sans rien ajouter à
+    // l'écran.
+
+    var testProgressTimer = null;
+
+    function getTestProgressBar() {
+
+        return dashboard
+            ? dashboard.querySelector('.tp9-test-progress')
+            : null;
+
+    }
+
+    function setTestProgress(done, total) {
+
+        var bar = getTestProgressBar();
+
+        if (!bar) {
+            return;
+        }
+
+        if (testProgressTimer) {
+
+            clearTimeout(testProgressTimer);
+
+            testProgressTimer = null;
+
+        }
+
+        bar.classList.add('tp9-test-progress-on');
+
+        bar.querySelector('.tp9-test-progress-fill').style.width =
+            (total ? Math.round((done / total) * 100) : 0) + '%';
+
+    }
+
+    function endTestProgress() {
+
+        var bar = getTestProgressBar();
+
+        if (!bar) {
+            return;
+        }
+
+        // La barre reste pleine un court instant : disparaître pile
+        // au moment où elle atteint 100 % donnerait l'impression
+        // qu'elle a été coupée avant la fin.
+        testProgressTimer = setTimeout(
+            function () {
+
+                testProgressTimer = null;
+
+                bar.classList.remove('tp9-test-progress-on');
+
+                bar.querySelector('.tp9-test-progress-fill').style.width =
+                    '0%';
+
+            },
+            500
+        );
+
+    }
+
+
     async function runProxyTestRound(list, channel, updateUI) {
 
         var roundResults = [];
+
+        if (updateUI) {
+            setTestProgress(0, list.length);
+        }
 
         for (var i = 0; i < list.length; i++) {
 
@@ -18207,8 +19145,14 @@ dashboardButton.style.visibility =
                             (result.latency ? ' · ' + result.latency + ' ms' : '')
                 );
 
+                setTestProgress(i + 1, list.length);
+
             }
 
+        }
+
+        if (updateUI) {
+            endTestProgress();
         }
 
         applyQuarantineRules(roundResults);
