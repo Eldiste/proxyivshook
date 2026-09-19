@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.5.0
+// @version      1.5.1
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -32,7 +32,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.5.0';
+    var CURRENT_VERSION = '1.5.1';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -861,6 +861,17 @@
             // "Habitudes". Clé "jour-heure", ex "2-21" = mardi 21h.
             watchHeatmap: {},
 
+            // Chaque bascule en lecture directe Twitch (= le moment
+            // où les pubs reviennent). C'est la raison d'être du
+            // script : ça ne peut pas rester une simple ligne noyée
+            // dans 300 logs.
+            directPlaybacks: [],
+
+            // Latences RÉELLES relevées pendant la lecture, par
+            // proxy : { id: [{ t, ms }] }. Distinct de proxyHistory,
+            // qui ne contient que les tests provoqués.
+            proxyLiveLatency: {},
+
             // 'network' | 'decoder' | 'estimate' : d'où viennent
             // les octets comptabilisés. Stocké dans les stats (et
             // pas en variable locale) pour que l'onglet dashboard,
@@ -904,6 +915,11 @@
                     stats.sessions =
                         Array.isArray(parsed.sessions) ? parsed.sessions : [];
                     stats.watchHeatmap = parsed.watchHeatmap || {};
+                    stats.directPlaybacks =
+                        Array.isArray(parsed.directPlaybacks)
+                            ? parsed.directPlaybacks
+                            : [];
+                    stats.proxyLiveLatency = parsed.proxyLiveLatency || {};
                     stats.bandwidthSource = parsed.bandwidthSource || null;
 
                     stats.totals = Object.assign(
@@ -1372,7 +1388,7 @@
 
         logEvent(
             'success',
-            'Relais ' + proxy.name +
+            'Proxy ' + proxy.name +
             (manual
                 ? ' sorti de quarantaine manuellement'
                 : ' de nouveau fonctionnel, sorti de quarantaine')
@@ -1390,7 +1406,7 @@
 
         logEvent(
             'warn',
-            'Relais ' + proxy.name + ' mis en quarantaine (' +
+            'Proxy ' + proxy.name + ' mis en quarantaine (' +
             testCount + ' échecs consécutifs sur 7 jours)'
         );
 
@@ -1552,6 +1568,23 @@
                 id: proxy.id,
                 name: proxy.name,
                 avgLatency: avgLatency,
+
+                // Latence subie pendant la vraie lecture, remontée
+                // par le Worker quand ce proxy gagne la course. Elle
+                // ne dit pas la même chose que la latence de test :
+                // l'une est provoquée sur une chaîne à un instant T,
+                // l'autre est ce que le flux a réellement coûté.
+                liveLatency: getLiveLatencyAverage(proxy.id),
+
+                // Les 20 derniers tests réussis, dans l'ordre, pour
+                // la micro-courbe du tableau : une moyenne sur 7
+                // jours noie une dégradation progressive.
+                latencySeries: recentOk
+                    .slice(-20)
+                    .map(function (entry) {
+                        return entry.latency;
+                    }),
+
                 testCount: recentAll.length,
                 successRate: successRate,
                 usage: pageStats.proxyUsage[proxy.id] || 0,
@@ -1638,6 +1671,254 @@
         });
 
         return best;
+
+    }
+
+    // ------------------------------------------------------------
+    // BASCULES EN LECTURE DIRECTE
+    // ------------------------------------------------------------
+    //
+    // Le toast, lui, est volontairement limité à un par quart d'heure
+    // et par chaîne (DIRECT_TOAST_COOLDOWN_MS) : c'est une alerte, la
+    // répéter serait pénible. Le COMPTAGE, lui, ne suit pas ce
+    // cooldown — il compterait faux. Il a sa propre fenêtre, bien
+    // plus courte : un seul échec provoque souvent plusieurs fetchs
+    // du manifest d'affilée (changement de qualité, reprise après
+    // coupure), et ce sont ces rafales qu'on regroupe, pas deux
+    // vraies bascules successives.
+
+    var DIRECT_PLAYBACK_DEDUPE_MS = 60 * 1000;
+    var DIRECT_PLAYBACKS_MAX = 500;
+
+    function recordDirectPlayback(channel, tried) {
+
+        var now = Date.now();
+
+        var list = pageStats.directPlaybacks;
+
+        var last = list[list.length - 1];
+
+        // Même chaîne, il y a moins d'une minute : c'est la même
+        // bascule qui se répète, pas une nouvelle.
+        if (
+            last &&
+            last.channel === channel &&
+            (now - last.t) < DIRECT_PLAYBACK_DEDUPE_MS
+        ) {
+
+            last.t = now;
+
+            last.repeats = (last.repeats || 0) + 1;
+
+            scheduleStatsSave();
+
+            return;
+
+        }
+
+        list.push({
+            t: now,
+            channel: channel,
+            tried: typeof tried === 'number' ? tried : null
+        });
+
+        if (list.length > DIRECT_PLAYBACKS_MAX) {
+            list.shift();
+        }
+
+        scheduleStatsSave();
+
+    }
+
+    function getDirectPlaybacks7d() {
+
+        var cutoff = Date.now() - STATS_HISTORY_MS;
+
+        return pageStats.directPlaybacks.filter(function (entry) {
+            return entry && entry.t >= cutoff;
+        });
+
+    }
+
+    // ------------------------------------------------------------
+    // LATENCE RÉELLE DU FLUX (mesurée pendant la lecture)
+    // ------------------------------------------------------------
+
+    function recordLiveLatency(proxyId, latency) {
+
+        if (!proxyId || typeof latency !== 'number' || latency < 0) {
+            return;
+        }
+
+        if (!pageStats.proxyLiveLatency[proxyId]) {
+            pageStats.proxyLiveLatency[proxyId] = [];
+        }
+
+        var samples = pageStats.proxyLiveLatency[proxyId];
+
+        samples.push({ t: Date.now(), ms: Math.round(latency) });
+
+        // Même fenêtre que proxyHistory : les deux latences
+        // affichées côte à côte doivent couvrir la même période,
+        // sinon les comparer n'a aucun sens.
+        var cutoff = Date.now() - STATS_HISTORY_MS;
+
+        while (samples.length && samples[0].t < cutoff) {
+            samples.shift();
+        }
+
+        scheduleStatsSave();
+
+    }
+
+    function getLiveLatencyAverage(proxyId) {
+
+        var cutoff = Date.now() - STATS_HISTORY_MS;
+
+        var samples = (pageStats.proxyLiveLatency[proxyId] || []).filter(
+            function (entry) {
+                return entry.t >= cutoff;
+            }
+        );
+
+        if (!samples.length) {
+            return null;
+        }
+
+        var sum = samples.reduce(function (acc, entry) {
+            return acc + entry.ms;
+        }, 0);
+
+        return Math.round(sum / samples.length);
+
+    }
+
+    // ------------------------------------------------------------
+    // DÉBIT INSTANTANÉ
+    // ------------------------------------------------------------
+    //
+    // Le Worker remonte les octets par paquets de 5 s : le débit est
+    // donc quasi gratuit à en déduire. Lissé sur les trois derniers
+    // paquets, sinon la valeur sautille d'un affichage à l'autre (un
+    // segment vidéo n'arrive pas à intervalle régulier).
+
+    var THROUGHPUT_MAX_AGE_MS = 20000;
+
+    // Poids du dernier échantillon dans la moyenne glissante : un
+    // segment vidéo n'arrive pas à intervalle régulier, une valeur
+    // brute sautillerait d'un affichage à l'autre.
+    var THROUGHPUT_SMOOTHING = 0.5;
+
+    // Un débit PAR ONGLET émetteur, pas un seul global. L'onglet
+    // dashboard n'a aucune vidéo à lui : son unique source, ce sont
+    // les messages des autres onglets. Il additionne donc ce que
+    // chacun télécharge, tandis que la carte de lecture du menu ne
+    // montre que le débit de SON onglet.
+    var throughputByTab = {};
+
+    function recordThroughputSample(tabId, bytes) {
+
+        if (!tabId) {
+            return;
+        }
+
+        var now = Date.now();
+
+        var previous = throughputByTab[tabId];
+
+        var elapsedMs = previous ? (now - previous.at) : 0;
+
+        // Premier paquet de cet onglet, ou reprise après une longue
+        // pause : aucune durée de référence, on note juste l'instant.
+        if (elapsedMs <= 0 || elapsedMs > THROUGHPUT_MAX_AGE_MS) {
+
+            throughputByTab[tabId] = { at: now, bps: null };
+
+            return;
+
+        }
+
+        var instant = bytes / (elapsedMs / 1000);
+
+        throughputByTab[tabId] = {
+            at: now,
+            bps:
+                previous.bps === null
+                    ? instant
+                    : previous.bps +
+                        (instant - previous.bps) * THROUGHPUT_SMOOTHING
+        };
+
+    }
+
+    function throughputForTab(tabId) {
+
+        var sample = throughputByTab[tabId];
+
+        if (
+            !sample ||
+            sample.bps === null ||
+            (Date.now() - sample.at) > THROUGHPUT_MAX_AGE_MS
+        ) {
+            return null;
+        }
+
+        return sample.bps;
+
+    }
+
+    // Débit de CET onglet : carte de lecture du menu.
+    function getLiveThroughputBps() {
+
+        return throughputForTab(TAB_ID);
+
+    }
+
+    // Débit de tous les onglets qui lisent : carte du dashboard.
+    // Les onglets fermés cessent d'émettre, leur entrée périme
+    // toute seule — on la retire au passage.
+    function getTotalLiveThroughputBps() {
+
+        var total = null;
+
+        Object.keys(throughputByTab).forEach(function (tabId) {
+
+            var bps = throughputForTab(tabId);
+
+            if (bps === null) {
+
+                if (
+                    (Date.now() - throughputByTab[tabId].at) >
+                    THROUGHPUT_MAX_AGE_MS
+                ) {
+                    delete throughputByTab[tabId];
+                }
+
+                return;
+
+            }
+
+            total = (total || 0) + bps;
+
+        });
+
+        return total;
+
+    }
+
+    function formatThroughput(bytesPerSecond) {
+
+        if (!bytesPerSecond || bytesPerSecond <= 0) {
+            return null;
+        }
+
+        var mbps = bytesPerSecond / (1024 * 1024);
+
+        if (mbps < 0.1) {
+            return Math.round(bytesPerSecond / 1024) + ' Ko/s';
+        }
+
+        return mbps.toFixed(1) + ' Mo/s';
 
     }
 
@@ -3022,6 +3303,82 @@
 
         }
 
+        // Bascules en direct : union dédupliquée sur (horodatage +
+        // chaîne). Surtout pas une concaténation — restaurer une
+        // sauvegarde qui recouvre en partie l'existant doublerait le
+        // compteur, alors que tout le reste de cette fonction est
+        // construit pour ne jamais gonfler les stats.
+        var directSeen = {};
+
+        pageStats.directPlaybacks.forEach(function (entry) {
+            directSeen[entry.t + '|' + entry.channel] = true;
+        });
+
+        (incoming.directPlaybacks || []).forEach(function (entry) {
+
+            if (!entry) {
+                return;
+            }
+
+            var key = entry.t + '|' + entry.channel;
+
+            if (!directSeen[key]) {
+
+                directSeen[key] = true;
+
+                pageStats.directPlaybacks.push(entry);
+
+            }
+
+        });
+
+        pageStats.directPlaybacks.sort(function (a, b) {
+            return a.t - b.t;
+        });
+
+        if (pageStats.directPlaybacks.length > DIRECT_PLAYBACKS_MAX) {
+
+            pageStats.directPlaybacks = pageStats.directPlaybacks.slice(
+                pageStats.directPlaybacks.length - DIRECT_PLAYBACKS_MAX
+            );
+
+        }
+
+        // Latences réelles : même principe, union sur l'horodatage.
+        Object.keys(incoming.proxyLiveLatency || {}).forEach(function (id) {
+
+            var current = pageStats.proxyLiveLatency[id] || [];
+
+            var seen = {};
+
+            current.forEach(function (entry) {
+                seen[entry.t] = true;
+            });
+
+            (incoming.proxyLiveLatency[id] || []).forEach(function (entry) {
+
+                if (entry && !seen[entry.t]) {
+
+                    seen[entry.t] = true;
+
+                    current.push(entry);
+
+                }
+
+            });
+
+            current.sort(function (a, b) {
+                return a.t - b.t;
+            });
+
+            var liveCutoff = Date.now() - STATS_HISTORY_MS;
+
+            pageStats.proxyLiveLatency[id] = current.filter(function (entry) {
+                return entry.t >= liveCutoff;
+            });
+
+        });
+
         if (!pageStats.bandwidthSource && incoming.bandwidthSource) {
             pageStats.bandwidthSource = incoming.bandwidthSource;
         }
@@ -3383,6 +3740,11 @@
                                 activeProxyInfo.channel
                             );
 
+                            recordLiveLatency(
+                                activeProxyInfo.proxyId,
+                                activeProxyInfo.latency
+                            );
+
                             logEvent(
                                 'success',
                                 'Proxy actif : ' +
@@ -3397,6 +3759,11 @@
                         } else if (
                             activeProxyInfo.direct
                         ) {
+
+                            recordDirectPlayback(
+                                activeProxyInfo.channel,
+                                activeProxyInfo.tried
+                            );
 
                             logEvent(
                                 'warn',
@@ -3418,6 +3785,26 @@
                     // le Worker HLS. Filtré sur TAB_ID : les autres
                     // onglets twitch.tv reçoivent le même message et
                     // ne doivent surtout pas le compter aussi.
+                    // Le DÉBIT, lui, se nourrit des messages de TOUS
+                    // les onglets (pas de filtre TAB_ID) : c'est la
+                    // seule façon pour l'onglet dashboard, qui ne lit
+                    // aucune vidéo, de connaître la bande passante en
+                    // cours. Les OCTETS, eux, restent filtrés plus
+                    // bas — les compter deux fois fausserait tout.
+                    if (
+                        event.data &&
+                        event.data.type === 'bandwidth'
+                    ) {
+
+                        recordThroughputSample(
+                            event.data.tabId,
+                            event.data.bytes
+                        );
+
+                        refreshLiveThroughput();
+
+                    }
+
                     if (
                         event.data &&
                         event.data.type === 'bandwidth' &&
@@ -3425,6 +3812,15 @@
                     ) {
 
                         lastNetworkBytesAt = Date.now();
+
+                        // Le débit s'affiche dans la carte de lecture
+                        // du menu : sans ce rafraîchissement, il
+                        // resterait figé sur la valeur du dernier
+                        // rendu (le menu ne se redessine qu'aux
+                        // changements de proxy).
+                        if (dashboardVisible) {
+                            updateActiveProxyDisplay();
+                        }
 
                         // Sert à retrouver la chaîne lue par le
                         // mini-player, qui n'est plus dans l'URL.
@@ -3556,10 +3952,19 @@
     <span class="tp9-btn-icon">📊</span> Ouvrir le dashboard complet
 </button>
 
+<div class="tp9-block">
+
 <div class="tp9-section-title tp9-proxy-title-row">
     <span>📡 PROXYS</span>
     <span class="tp9-proxy-count"></span>
 </div>
+
+<input
+    type="text"
+    class="tp9-proxy-search"
+    placeholder="Rechercher un proxy…"
+    autocomplete="off"
+>
 
 <div class="tp9-proxy-list"></div>
 
@@ -3572,13 +3977,17 @@
 
 <div class="tp9-add-container"></div>
 
-<div class="tp9-divider"></div>
+</div>
+
+<div class="tp9-block">
 
 <div class="tp9-section-title">⚙️ RÉGLAGES</div>
 
 <div class="tp9-settings-list">
 
-    <label class="tp9-toggle-row">
+    <label class="tp9-toggle-row"
+        data-tp9-tip="Repli sur Twitch"
+        data-tp9-tip-sub="Si aucun proxy ne répond, le flux repasse par Twitch — et les pubs avec. Désactivé, la lecture échoue plutôt que de les laisser revenir.">
         <span class="tp9-toggle-label">
             <span class="tp9-toggle-icon">🔁</span>
             Fallback automatique
@@ -3589,7 +3998,9 @@
         </span>
     </label>
 
-    <label class="tp9-toggle-row">
+    <label class="tp9-toggle-row"
+        data-tp9-tip="Qualité en arrière-plan"
+        data-tp9-tip-sub="Fait croire à Twitch que l'onglet est toujours au premier plan, pour qu'il cesse de baisser la qualité quand tu passes ailleurs.">
         <span class="tp9-toggle-label">
             <span class="tp9-toggle-icon">🎬</span>
             Qualité en arrière-plan
@@ -3647,7 +4058,11 @@
 
 </div>
 
-<div class="tp9-divider"></div>
+</div>
+
+<div class="tp9-block">
+
+<div class="tp9-section-title">🛠️ ACTIONS</div>
 
 <div class="tp9-actions">
 
@@ -3679,6 +4094,8 @@
     accept="application/json"
     style="display:none;"
 >
+
+</div>
 
             </div>
 
@@ -4035,6 +4452,23 @@ document.addEventListener(
 
 
         dashboard
+            .querySelector('.tp9-proxy-search')
+            .addEventListener(
+                'input',
+                function (event) {
+
+                    proxySearchQuery = event.target.value;
+
+                    // Seule la liste est reconstruite : le champ, lui,
+                    // vit dans le squelette du menu et garde donc son
+                    // focus et son curseur.
+                    renderProxyList();
+
+                }
+            );
+
+
+        dashboard
             .querySelector('.tp9-add-proxy')
             .addEventListener(
                 'click',
@@ -4170,15 +4604,6 @@ document.addEventListener(
         }
 
 
-        var list =
-            dashboard.querySelector(
-                '.tp9-proxy-list'
-            );
-
-
-        list.innerHTML = '';
-
-
         var enabledCount =
             pageConfig.proxies.filter(
                 function (p) {
@@ -4198,8 +4623,234 @@ document.addEventListener(
             ' actifs';
 
 
-        pageConfig.proxies.forEach(
-            function (proxy, index) {
+        var searchField =
+            dashboard.querySelector('.tp9-proxy-search');
+
+        // En dessous d'une dizaine de proxys, un champ de recherche
+        // est du décor : les groupes suffisent largement à s'y
+        // retrouver.
+        searchField.style.display =
+            pageConfig.proxies.length >= PROXY_SEARCH_MIN ? 'block' : 'none';
+
+        renderProxyList();
+
+        renderDashboardSettings();
+
+    }
+
+
+    // ------------------------------------------------------------
+    // GROUPES DE PROXYS
+    // ------------------------------------------------------------
+    //
+    // Treize proxys en une seule liste plate, c'était illisible. Ils
+    // sont maintenant regroupés par région — l'information existait
+    // déjà (getProxyRegion, qui se fie à l'id et pas au nom).
+    //
+    // Conséquence assumée : le tri automatique par ping ne classe
+    // plus la liste entière, il classe l'intérieur de chaque groupe.
+    // On perd « le plus rapide est tout en haut », on gagne de
+    // pouvoir replier une région entière.
+
+    var PROXY_GROUPS_KEY = 'twitchProxyGroupsV1';
+
+    var PROXY_SEARCH_MIN = 10;
+
+    var PROXY_GROUPS = [
+        { id: 'eu', label: 'Europe', icon: '🇪🇺', accent: '#4fc3f7' },
+        { id: 'na', label: 'Amérique du Nord', icon: '🇺🇸', accent: '#ff9d4d' },
+        { id: 'as', label: 'Asie', icon: '🌏', accent: '#00d084' },
+        { id: 'sa', label: 'Amérique du Sud', icon: '🌎', accent: '#ff8fd6' },
+        { id: 'custom', label: 'Perso', icon: '⚙️', accent: '#bf94ff' },
+        { id: 'other', label: 'Autres', icon: '📡', accent: '#9147ff' },
+        { id: 'quarantine', label: 'En quarantaine', icon: '💤', accent: '#ffcf7a' }
+    ];
+
+    function loadCollapsedGroups() {
+
+        try {
+
+            var saved = localStorage.getItem(PROXY_GROUPS_KEY);
+
+            if (saved) {
+                return JSON.parse(saved) || {};
+            }
+
+        } catch (e) {}
+
+        // La quarantaine est repliée d'office : ce sont justement
+        // les proxys dont il n'y a rien à attendre.
+        return { quarantine: true };
+
+    }
+
+    var collapsedGroups = loadCollapsedGroups();
+
+    var proxySearchQuery = '';
+
+    function saveCollapsedGroups() {
+
+        try {
+
+            localStorage.setItem(
+                PROXY_GROUPS_KEY,
+                JSON.stringify(collapsedGroups)
+            );
+
+        } catch (e) {}
+
+    }
+
+    // La quarantaine passe avant tout le reste : un proxy écarté de
+    // la course n'a plus rien à faire au milieu de sa région.
+    function getProxyGroupId(proxy) {
+
+        if (proxy.quarantine) {
+            return 'quarantine';
+        }
+
+        if (proxy.custom) {
+            return 'custom';
+        }
+
+        return getProxyRegion(proxy) || 'other';
+
+    }
+
+    function renderProxyList() {
+
+        var list = dashboard.querySelector('.tp9-proxy-list');
+
+        list.innerHTML = '';
+
+        var query = proxySearchQuery.trim().toLowerCase();
+
+        var buckets = {};
+
+        pageConfig.proxies.forEach(function (proxy) {
+
+            if (
+                query &&
+                proxy.name.toLowerCase().indexOf(query) === -1
+            ) {
+                return;
+            }
+
+            var groupId = getProxyGroupId(proxy);
+
+            buckets[groupId] = buckets[groupId] || [];
+
+            buckets[groupId].push(proxy);
+
+        });
+
+        var shown = 0;
+
+        PROXY_GROUPS.forEach(function (group) {
+
+            var proxies = buckets[group.id];
+
+            if (!proxies || !proxies.length) {
+                return;
+            }
+
+            shown += proxies.length;
+
+            // Une recherche en cours déplie tout : cacher un
+            // résultat derrière un groupe replié n'aurait aucun sens.
+            var collapsed = !query && !!collapsedGroups[group.id];
+
+            var groupEl = document.createElement('div');
+
+            groupEl.className =
+                'tp9-group' + (collapsed ? ' tp9-group-collapsed' : '');
+
+            groupEl.style.setProperty('--accent', group.accent);
+
+            var groupEnabled = proxies.filter(function (proxy) {
+                return proxy.enabled;
+            }).length;
+
+            groupEl.innerHTML =
+                '<div class="tp9-group-head">' +
+                    '<span class="tp9-group-caret">▾</span>' +
+                    '<span class="tp9-group-icon">' + group.icon + '</span>' +
+                    '<span class="tp9-group-name">' +
+                        escapeHTML(group.label) +
+                    '</span>' +
+                    '<button type="button" class="tp9-group-count"' +
+                        ' data-tp9-tip="Tout activer ou tout désactiver"' +
+                        ' data-tp9-tip-sub="Agit sur les ' + proxies.length +
+                        ' proxys de ce groupe.">' +
+                        groupEnabled + '/' + proxies.length +
+                    '</button>' +
+                '</div>' +
+                '<div class="tp9-group-body"></div>';
+
+            var body = groupEl.querySelector('.tp9-group-body');
+
+            proxies.forEach(function (proxy) {
+                body.appendChild(buildProxyRow(proxy));
+            });
+
+            groupEl
+                .querySelector('.tp9-group-head')
+                .addEventListener('click', function (event) {
+
+                    // Même piège que partout dans ce menu : la ligne
+                    // est reconstruite juste après, donc si le clic
+                    // continuait à remonter, le listener global
+                    // « clic en dehors » ne retrouverait plus son
+                    // ancêtre #tp9-dashboard et fermerait tout.
+                    event.stopPropagation();
+
+                    collapsedGroups[group.id] = !collapsedGroups[group.id];
+
+                    saveCollapsedGroups();
+
+                    renderProxyList();
+
+                });
+
+            groupEl
+                .querySelector('.tp9-group-count')
+                .addEventListener('click', function (event) {
+
+                    // Coupe aussi la remontée vers l'en-tête, sinon
+                    // le groupe se replierait dans la foulée.
+                    event.stopPropagation();
+
+                    var turnOn = groupEnabled < proxies.length;
+
+                    proxies.forEach(function (proxy) {
+                        proxy.enabled = turnOn;
+                    });
+
+                    saveConfig(pageConfig);
+
+                    broadcastConfig();
+
+                    renderDashboard();
+
+                });
+
+            list.appendChild(groupEl);
+
+        });
+
+        if (!shown) {
+
+            list.innerHTML =
+                '<div class="tp9-empty">Aucun proxy ne correspond.</div>';
+
+        }
+
+    }
+
+
+    // Construit la ligne d'UN proxy. Sortie de renderDashboard pour
+    // que renderProxyList puisse la réutiliser groupe par groupe.
+    function buildProxyRow(proxy) {
 
                 var row =
                     document.createElement(
@@ -4309,7 +4960,7 @@ document.addEventListener(
                     proxy.quarantine
                         ? '<button class="tp9-unquarantine" type="button"' +
                             ' data-tp9-tip="Sortir de la quarantaine"' +
-                            ' data-tp9-tip-sub="Le relais est protégé 24 h avant de pouvoir y' +
+                            ' data-tp9-tip-sub="Le proxy est protégé 24 h avant de pouvoir y' +
                             ' retourner."' +
                             ' aria-label="Sortir de la quarantaine">🔓</button>'
                         : '';
@@ -4529,13 +5180,14 @@ document.addEventListener(
                 }
 
 
-                list.appendChild(
-                    row
-                );
+                return row;
 
-            }
-        );
+    }
 
+
+    // Tout ce qui, dans le menu, n'est pas la liste des proxys :
+    // interrupteurs, listes déroulantes, bannière de sauvegarde.
+    function renderDashboardSettings() {
 
         dashboard
             .querySelector(
@@ -4712,7 +5364,7 @@ document.addEventListener(
 
             valueEl.textContent = 'Twitch en direct';
 
-            metaEl.textContent = 'aucun relais';
+            metaEl.textContent = 'aucun proxy';
 
             return;
 
@@ -4722,9 +5374,6 @@ document.addEventListener(
 
         valueEl.textContent = activeProxyInfo.proxyName;
 
-        // Latence du dernier test de CE relais : la seule mesure
-        // qu'on ait sur lui, et ce qui rend la carte utile plutôt
-        // que décorative.
         var proxy =
             pageConfig.proxies.find(
                 function (p) {
@@ -4732,10 +5381,31 @@ document.addEventListener(
                 }
             );
 
+        // Latence de la course RÉELLEMENT gagnée par ce proxy si le
+        // Worker l'a remontée : c'est ce que la lecture a vraiment
+        // coûté. À défaut seulement, celle du dernier test provoqué.
+        var latencyText = null;
+
+        if (typeof activeProxyInfo.latency === 'number') {
+
+            latencyText = activeProxyInfo.latency + ' ms';
+
+        } else if (proxy && proxy.lastTest && proxy.lastTest.ok) {
+
+            latencyText = proxy.lastTest.latency + ' ms';
+
+        }
+
+        // Le débit, lui, ne vient pas du proxy mais des octets que le
+        // Worker remonte toutes les 5 s. La carte "Bande passante
+        // totale" du dashboard précise elle-même qu'elle n'est pas le
+        // débit actuel : le voici, au seul endroit où il a du sens.
+        var throughputText = formatThroughput(getLiveThroughputBps());
+
         metaEl.textContent =
-            (proxy && proxy.lastTest && proxy.lastTest.ok)
-                ? proxy.lastTest.latency + ' ms'
-                : '';
+            [latencyText, throughputText]
+                .filter(Boolean)
+                .join(' · ');
 
     }
 
@@ -5457,8 +6127,9 @@ function showAddProxyForm() {
     // permanence, poser un écouteur sur chaque bouton serait à
     // refaire à chaque rendu.
     //
-    // Cette liste doit rester alignée avec les sélecteurs du bloc
-    // « HALO QUI SUIT LE CURSEUR » des deux feuilles de style.
+    // Cette liste doit rester alignée avec les sélecteurs des blocs
+    // « HALO QUI SUIT LE CURSEUR » des deux feuilles de style (un
+    // bloc pour les boutons, un second pour les surfaces).
     var SPOTLIGHT_SELECTOR = [
         '#tp9-player-button',
         '.tp9-close',
@@ -5480,7 +6151,24 @@ function showAddProxyForm() {
         '.tp9s-clear-logs',
         '.tp9s-msg-count',
         '.tp9s-streamer-delete',
-        '.tp9-chat-modal-close'
+        '.tp9-chat-modal-close',
+
+        // Surfaces, et non boutons : la ligne d'un relais bascule
+        // active/desactive, la ligne d'un reglage est un <label> qui
+        // pilote son interrupteur, les cartes de la Vue d'ensemble
+        // renvoient vers leur onglet. L'en-tete des tableaux est
+        // exclu : c'est une ligne comme les autres pour le CSS, mais
+        // rien n'y reagit au survol.
+        //
+        // .tp9-proxy (la ligne entiere) et non .tp9-proxy-main : la
+        // zone cliquable est en retrait des bords a cause du padding
+        // de la ligne, le halo s'y arretait donc avant le cadre.
+        '.tp9-proxy',
+        '.tp9-group-head',
+        '.tp9-toggle-row',
+        '.tp9s-card',
+        '.tp9s-table-row:not(.tp9s-table-head)',
+        '.tp9s-lead-row'
     ].join(',');
 
     // Une seule écriture de style par frame, pour tout le script :
@@ -5605,6 +6293,7 @@ function showAddProxyForm() {
 
 
         dashboardButton.dataset.tp9Tip = 'Twitch Proxy Manager';
+        dashboardButton.dataset.tp9TipSub = 'Alt + P pour ouvrir ou fermer';
 
 dashboardButton.style.visibility =
     'hidden';
@@ -6203,14 +6892,14 @@ dashboardButton.style.visibility =
             title: 'Lecture directe Twitch',
 
             text:
-                'Aucun relais n\'a répondu pour ' + channel +
+                'Aucun proxy n\'a répondu pour ' + channel +
                 ' : le flux passe par Twitch, les pubs peuvent revenir.',
 
             duration: 12000,
 
             actions: [
                 {
-                    label: '🧪 Retester les relais',
+                    label: '🧪 Retester les proxys',
                     onClick: function (button) {
 
                         if (testInProgress) {
@@ -6249,7 +6938,7 @@ dashboardButton.style.visibility =
 
             icon: '✅',
 
-            title: 'Relais rétabli',
+            title: 'Proxy rétabli',
 
             text: 'Le flux repasse par ' + proxyName + '.',
 
@@ -9107,6 +9796,409 @@ dashboardButton.style.visibility =
 
             }
 
+
+            /* =====================================================
+               HALO QUI SUIT LE CURSEUR — SURFACES
+               -----------------------------------------------------
+               Même mécanique que le bloc ci-dessus, mais sur des
+               éléments qui ne sont pas des boutons et qui se
+               cliquent quand même : la ligne d'un relais bascule
+               activé / désactivé, la ligne d'un réglage est un
+               <label> qui pilote son interrupteur.
+
+               Le halo est posé sur .tp9-proxy, la ligne ENTIÈRE, et
+               non sur sa seule zone cliquable .tp9-proxy-main : celle-
+               ci est en retrait des bords à cause du padding de la
+               ligne, et la lumière s'arrêtait donc visiblement avant
+               le cadre. Conséquence assumée : survoler les boutons 🔓
+               ou 🗑 au bout de la ligne allume les deux halos, le
+               leur par-dessus celui de la ligne. .tp9-proxy est en
+               overflow: hidden, le halo est de toute façon recadré
+               sur ses coins arrondis.
+            ===================================================== */
+
+            .tp9-proxy,
+            .tp9-toggle-row {
+
+                position: relative;
+
+                /* Deux bandes larges mais basses : un halo de 110 px
+                   y éclairerait toute la hauteur d'un coup et on ne
+                   le verrait plus se déplacer. */
+                --tp9-spot: 80px;
+
+            }
+
+
+            .tp9-proxy::after,
+            .tp9-toggle-row::after {
+
+                content: '';
+
+                position: absolute;
+
+                inset: 0;
+
+                border-radius: inherit;
+
+                pointer-events: none;
+
+                opacity: 0;
+
+                background:
+                    radial-gradient(
+                        circle var(--tp9-spot, 110px)
+                            at var(--mx, 50%) var(--my, 50%),
+                        rgba(255,255,255,.2),
+                        rgba(255,255,255,0) 72%);
+
+                transition: opacity .15s ease;
+
+            }
+
+
+            .tp9-proxy:hover::after,
+            .tp9-toggle-row:hover::after {
+
+                opacity: 1;
+
+            }
+
+            /* =====================================================
+               BLOCS, GROUPES ET VERRE
+               -----------------------------------------------------
+               Écrit en dernier, comme les autres blocs de refonte :
+               à spécificité égale la dernière règle gagne.
+            ===================================================== */
+
+            /* Le menu était à 97 % d'opacité avec un flou de 12 px,
+               donc opaque en pratique. Plus transparent + un flou
+               plus large, ça devient vraiment du verre ; le dégradé
+               interne rattrape la lisibilité sur un stream clair. */
+
+            #tp9-dashboard {
+
+                background:
+                    linear-gradient(180deg,
+                        rgba(22,22,28,.88),
+                        rgba(10,10,13,.82));
+
+                backdrop-filter: blur(20px) saturate(140%);
+
+                -webkit-backdrop-filter: blur(20px) saturate(140%);
+
+                border-color: rgba(255,255,255,.12);
+
+            }
+
+
+            .tp9-block {
+
+                margin-bottom: 10px;
+
+                padding: 10px 10px 8px;
+
+                border-radius: 11px;
+
+                background: rgba(255,255,255,.028);
+
+                border: 1px solid rgba(255,255,255,.055);
+
+            }
+
+
+            .tp9-block:last-child {
+
+                margin-bottom: 0;
+
+            }
+
+
+            /* Le titre porte déjà sa marge basse, inutile d'en
+               ajouter une au bloc. */
+
+            .tp9-block .tp9-section-title {
+
+                margin-bottom: 9px;
+
+            }
+
+
+            /* ---- champ de recherche ---- */
+
+            .tp9-proxy-search {
+
+                width: 100%;
+
+                margin-bottom: 8px;
+
+                padding: 7px 10px;
+
+                box-sizing: border-box;
+
+                border: 1px solid rgba(255,255,255,.1);
+
+                border-radius: 8px;
+
+                outline: none;
+
+                background: rgba(0,0,0,.3);
+
+                color: #efeff1;
+
+                font-family: inherit;
+
+                font-size: 12px;
+
+                transition:
+                    border-color .12s ease,
+                    background-color .12s ease;
+
+            }
+
+
+            .tp9-proxy-search:focus {
+
+                border-color: #9147ff;
+
+                background: rgba(0,0,0,.45);
+
+            }
+
+
+            .tp9-proxy-search::placeholder {
+
+                color: #6f6f7a;
+
+            }
+
+
+            /* ---- groupes ---- */
+
+            .tp9-group {
+
+                --accent: #9147ff;
+
+                margin-bottom: 8px;
+
+            }
+
+
+            .tp9-group:last-child {
+
+                margin-bottom: 0;
+
+            }
+
+
+            .tp9-group-head {
+
+                position: relative;
+
+                display: flex;
+
+                align-items: center;
+
+                gap: 7px;
+
+                padding: 6px 8px;
+
+                margin-bottom: 5px;
+
+                border-radius: 8px;
+
+                background:
+                    linear-gradient(90deg,
+                        color-mix(in srgb, var(--accent) 16%, transparent),
+                        rgba(255,255,255,.02) 70%);
+
+                border: 1px solid
+                    color-mix(in srgb, var(--accent) 22%, transparent);
+
+                cursor: pointer;
+
+                user-select: none;
+
+                --tp9-spot: 70px;
+
+                transition: border-color .12s ease;
+
+            }
+
+
+            .tp9-group-head:hover {
+
+                border-color:
+                    color-mix(in srgb, var(--accent) 45%, transparent);
+
+            }
+
+
+            .tp9-group-caret {
+
+                flex: 0 0 auto;
+
+                width: 10px;
+
+                color: color-mix(in srgb, var(--accent) 80%, #fff);
+
+                font-size: 9px;
+
+                line-height: 1;
+
+                transition: transform .15s ease;
+
+            }
+
+
+            .tp9-group-collapsed .tp9-group-caret {
+
+                transform: rotate(-90deg);
+
+            }
+
+
+            .tp9-group-icon {
+
+                flex: 0 0 auto;
+
+                font-size: 12px;
+
+            }
+
+
+            .tp9-group-name {
+
+                flex: 1 1 auto;
+
+                min-width: 0;
+
+                overflow: hidden;
+
+                text-overflow: ellipsis;
+
+                white-space: nowrap;
+
+                font-size: 11px;
+
+                font-weight: 700;
+
+                letter-spacing: .3px;
+
+                color: #dcdce2;
+
+            }
+
+
+            .tp9-group-count {
+
+                position: relative;
+
+                flex: 0 0 auto;
+
+                border: 0;
+
+                padding: 2px 7px;
+
+                border-radius: 999px;
+
+                background:
+                    color-mix(in srgb, var(--accent) 20%, transparent);
+
+                color: color-mix(in srgb, var(--accent) 75%, #fff);
+
+                font-family: inherit;
+
+                font-size: 10px;
+
+                font-weight: 700;
+
+                cursor: pointer;
+
+                --tp9-spot: 26px;
+
+                transition: background-color .12s ease;
+
+            }
+
+
+            .tp9-group-count:hover {
+
+                background:
+                    color-mix(in srgb, var(--accent) 38%, transparent);
+
+            }
+
+
+            .tp9-group-collapsed .tp9-group-body {
+
+                display: none;
+
+            }
+
+
+            .tp9-empty {
+
+                padding: 14px 8px;
+
+                text-align: center;
+
+                color: #6f6f7a;
+
+                font-size: 12px;
+
+            }
+
+
+            /* Le halo suit déjà le curseur sur les lignes de proxy et
+               les réglages : l'en-tête de groupe et son compteur sont
+               deux surfaces cliquables de plus. */
+
+            .tp9-group-head::after,
+            .tp9-group-count::after {
+
+                content: '';
+
+                position: absolute;
+
+                inset: 0;
+
+                border-radius: inherit;
+
+                pointer-events: none;
+
+                opacity: 0;
+
+                background:
+                    radial-gradient(
+                        circle var(--tp9-spot, 110px)
+                            at var(--mx, 50%) var(--my, 50%),
+                        rgba(255,255,255,.2),
+                        rgba(255,255,255,0) 72%);
+
+                transition: opacity .15s ease;
+
+            }
+
+
+            .tp9-group-head:hover::after,
+            .tp9-group-count:hover::after {
+
+                opacity: 1;
+
+            }
+
+
+            @media (prefers-reduced-motion: reduce) {
+
+                .tp9-group-caret {
+
+                    transition: none;
+
+                }
+
+            }
+
         `;
 
 
@@ -9625,6 +10717,65 @@ dashboardButton.style.visibility =
             }
 
 
+            .tp9s-card-top-right {
+
+                display: flex;
+
+                align-items: center;
+
+                gap: 7px;
+
+            }
+
+
+            .tp9s-card-live {
+
+                display: inline-flex;
+
+                align-items: center;
+
+                gap: 5px;
+
+                padding: 3px 8px;
+
+                border-radius: 999px;
+
+                background: color-mix(in srgb, var(--accent) 20%, transparent);
+
+                color: var(--accent);
+
+                font-size: 10.5px;
+
+                font-weight: 800;
+
+                white-space: nowrap;
+
+            }
+
+
+            .tp9s-card-live-dot {
+
+                width: 6px;
+                height: 6px;
+
+                border-radius: 50%;
+
+                background: currentColor;
+
+                animation: tp9s-live-pulse 2s ease-out infinite;
+
+            }
+
+
+            @keyframes tp9s-live-pulse {
+
+                0% { opacity: 1; box-shadow: 0 0 0 0 currentColor; }
+                70% { opacity: .55; box-shadow: 0 0 0 5px transparent; }
+                100% { opacity: 1; box-shadow: 0 0 0 0 transparent; }
+
+            }
+
+
             .tp9s-card-sub {
 
                 font-size: 11px;
@@ -9834,7 +10985,57 @@ dashboardButton.style.visibility =
 
             .tp9s-table-row-relais {
 
-                grid-template-columns: 34px 1.4fr .7fr 1fr 1fr .8fr .9fr 1.2fr;
+                grid-template-columns:
+                    30px 1.2fr .5fr 1.15fr .8fr .85fr .6fr .7fr 1fr;
+
+            }
+
+
+            .tp9s-td-latency {
+
+                display: flex;
+
+                align-items: center;
+
+                gap: 6px;
+
+                font-weight: 700;
+
+            }
+
+
+            .tp9s-td-live {
+
+                font-weight: 700;
+
+            }
+
+
+            .tp9s-spark-wrap {
+
+                display: inline-flex;
+
+                align-items: center;
+
+                opacity: .75;
+
+                transition: opacity .15s ease;
+
+            }
+
+
+            .tp9s-table-row:hover .tp9s-spark-wrap {
+
+                opacity: 1;
+
+            }
+
+
+            .tp9s-spark {
+
+                display: block;
+
+                overflow: visible;
 
             }
 
@@ -10051,6 +11252,88 @@ dashboardButton.style.visibility =
                 max-height: 60vh;
 
                 overflow-y: auto;
+
+            }
+
+
+            .tp9s-log-filters {
+
+                display: flex;
+
+                align-items: center;
+
+                flex-wrap: wrap;
+
+                gap: 10px;
+
+                margin-bottom: 12px;
+
+            }
+
+
+            .tp9s-log-level-btn {
+
+                display: inline-flex;
+
+                align-items: center;
+
+                gap: 6px;
+
+            }
+
+
+            .tp9s-log-level-count {
+
+                opacity: .7;
+
+                font-size: 10px;
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            .tp9s-log-search {
+
+                flex: 1 1 200px;
+
+                min-width: 160px;
+
+                padding: 7px 11px;
+
+                border: 1px solid rgba(255,255,255,.1);
+
+                border-radius: 8px;
+
+                outline: none;
+
+                background: rgba(0,0,0,.3);
+
+                color: #efeff1;
+
+                font-family: inherit;
+
+                font-size: 12px;
+
+                transition:
+                    border-color .12s ease,
+                    background-color .12s ease;
+
+            }
+
+
+            .tp9s-log-search:focus {
+
+                border-color: #9147ff;
+
+                background: rgba(0,0,0,.45);
+
+            }
+
+
+            .tp9s-log-search::placeholder {
+
+                color: #6f6f7a;
 
             }
 
@@ -11718,6 +13001,14 @@ dashboardButton.style.visibility =
 
                 }
 
+                /* La pastille de débit reste lisible sans clignoter. */
+
+                .tp9s-card-live-dot {
+
+                    animation: none;
+
+                }
+
             }
 
             /* =====================================================
@@ -12519,6 +13810,217 @@ dashboardButton.style.visibility =
 
             }
 
+
+            /* =====================================================
+               HALO QUI SUIT LE CURSEUR — CARTES ET LIGNES
+               -----------------------------------------------------
+               Les surfaces, pas seulement les boutons : cartes de la
+               Vue d'ensemble et des Habitudes, lignes des tableaux
+               Relais et Streamers.
+
+               .tp9s-table-head est exclue partout : pour le CSS c'est
+               une ligne comme les autres, mais rien n'y réagit au
+               survol (même exclusion que sa règle de survol plus
+               haut). Ni transform ni animation ici : c'est ce qui
+               évite la barre de défilement fantôme sous les tableaux,
+               et ce qui fait survivre l'effet à
+               prefers-reduced-motion.
+            ===================================================== */
+
+            .tp9s-card,
+            .tp9s-table-row:not(.tp9s-table-head),
+            .tp9s-lead-row {
+
+                position: relative;
+
+            }
+
+
+            .tp9s-card::after,
+            .tp9s-table-row:not(.tp9s-table-head)::after,
+            .tp9s-lead-row::after {
+
+                content: '';
+
+                position: absolute;
+
+                inset: 0;
+
+                border-radius: inherit;
+
+                pointer-events: none;
+
+                opacity: 0;
+
+                background:
+                    radial-gradient(
+                        circle var(--tp9-spot, 110px)
+                            at var(--mx, 50%) var(--my, 50%),
+                        rgba(255,255,255,.2),
+                        rgba(255,255,255,0) 72%);
+
+                transition: opacity .15s ease;
+
+            }
+
+
+            .tp9s-card:hover::after,
+            .tp9s-table-row:not(.tp9s-table-head):hover::after,
+            .tp9s-lead-row:hover::after {
+
+                opacity: 1;
+
+            }
+
+
+            /* Une carte est large ET haute : le halo peut y être plus
+               généreux sans tout éclairer. Une ligne de tableau est
+               une bande basse, on le resserre. */
+
+            .tp9s-card {
+
+                --tp9-spot: 150px;
+
+            }
+
+
+            .tp9s-table-row,
+            .tp9s-lead-row {
+
+                --tp9-spot: 90px;
+
+            }
+
+
+            /* =====================================================
+               LIGNES À BARRES — sessions et jours de la semaine
+               -----------------------------------------------------
+               Deux défauts corrigés ici :
+
+               - la colonne de date passait sur deux lignes ("sam.
+                 19/09 14:28" ne tenait pas en 150 px), ce qui
+                 désalignait toute la ligne ;
+               - toutes les valeurs étaient données par une barre à
+                 l'échelle du maximum, donc quand les jours se
+                 ressemblent (5 h contre 6 h 30) elles paraissaient
+                 toutes pleines. Le pourcentage à droite donne le
+                 point de repère qui manquait.
+            ===================================================== */
+
+            .tp9s-bar-row {
+
+                white-space: nowrap;
+
+            }
+
+
+            .tp9s-session-row {
+
+                grid-template-columns: 112px 106px 1fr 62px;
+
+            }
+
+
+            .tp9s-weekday-row {
+
+                grid-template-columns: 112px 1fr 62px 46px;
+
+            }
+
+
+            .tp9s-bar-label {
+
+                min-width: 0;
+
+                overflow: hidden;
+
+                text-overflow: ellipsis;
+
+            }
+
+
+            .tp9s-bar-range {
+
+                color: #8b8b95;
+
+                font-size: 11.5px;
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            .tp9s-bar-value {
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            .tp9s-bar-pct {
+
+                text-align: right;
+
+                color: #7e7e8a;
+
+                font-size: 11px;
+
+                font-variant-numeric: tabular-nums;
+
+            }
+
+
+            .tp9s-bar-track {
+
+                height: 9px;
+
+            }
+
+
+            /* Un jour sans visionnage : la couleur du jour n'a plus
+               rien à signaler, elle ne doit pas attirer l'œil. */
+
+            .tp9s-bar-empty .tp9s-bar-label,
+            .tp9s-bar-empty .tp9s-bar-value {
+
+                opacity: .4;
+
+            }
+
+
+            /* Le jour le plus chargé se repère sans lire les
+               chiffres. */
+
+            .tp9s-bar-top .tp9s-bar-label {
+
+                color: #fff;
+
+                font-weight: 700;
+
+            }
+
+
+            .tp9s-bar-top .tp9s-bar-fill {
+
+                box-shadow: 0 0 10px -2px var(--bar, #9147ff);
+
+            }
+
+
+            /* Une carte non cliquable affichait le curseur « texte »
+               (la barre en I) dès qu'on passait sur ses libellés :
+               elle se lit, elle ne s'édite pas. Le :not() sert deux
+               fois — il laisse leur curseur main aux cartes
+               cliquables, et il évite que cette règle, écrite après
+               les leurs, ne l'écrase (à spécificité égale, la
+               dernière gagne). */
+
+            .tp9s-card:not(.tp9s-card-clickable) {
+
+                cursor: default;
+
+            }
+
         `;
 
         document.head.appendChild(style);
@@ -12536,7 +14038,7 @@ dashboardButton.style.visibility =
 
     var STATS_TABS = [
         { id: 'overview', label: 'Vue d’ensemble', icon: '📊', group: 'GÉNÉRAL' },
-        { id: 'relais', label: 'Relais', icon: '📡', group: 'GÉNÉRAL' },
+        { id: 'relais', label: 'Proxys', icon: '📡', group: 'GÉNÉRAL' },
         { id: 'streamers', label: 'Streamers', icon: '🎥', group: 'GÉNÉRAL' },
         { id: 'habitudes', label: 'Habitudes', icon: '🕒', group: 'GÉNÉRAL' },
         { id: 'sauvegarde', label: 'Sauvegarde', icon: '💾', group: 'SYSTÈME' },
@@ -12653,10 +14155,34 @@ dashboardButton.style.visibility =
         statsDashboard.querySelector('.tp9s-reset-stats')
             .addEventListener('click', resetStatsData);
 
+        setInterval(refreshLiveThroughput, 5000);
+
         // Délégué : le contenu (cartes, tableaux, ...) est
         // reconstruit à chaque rendu, on écoute donc au niveau du
         // conteneur persistant plutôt que sur chaque élément.
         statsDashboard.addEventListener('click', function (event) {
+
+            // Les boutons de niveau portent AUSSI la classe des
+            // boutons de période (même habillage, pas de CSS
+            // dupliqué) : il faut donc les reconnaître AVANT, sinon
+            // le test suivant les capte et ne fait rien.
+            var logLevelBtn = event.target.closest('.tp9s-log-level-btn');
+
+            if (logLevelBtn) {
+
+                var level = logLevelBtn.getAttribute('data-log-level');
+
+                if (level !== statsLogLevel) {
+
+                    statsLogLevel = level;
+
+                    refreshLogList();
+
+                }
+
+                return;
+
+            }
 
             var chartBtn = event.target.closest(
                 '.tp9s-chart-range-btn, .tp9s-chart-metric-btn'
@@ -12765,6 +14291,22 @@ dashboardButton.style.visibility =
                 }
 
             }
+
+        });
+
+        // Écoute déléguée, comme les clics : le champ est recréé à
+        // chaque rendu complet de l'onglet.
+        statsDashboard.addEventListener('input', function (event) {
+
+            var search = event.target.closest('.tp9s-log-search');
+
+            if (!search) {
+                return;
+            }
+
+            statsLogQuery = search.value;
+
+            refreshLogList();
 
         });
 
@@ -13065,13 +14607,292 @@ dashboardButton.style.visibility =
     }
 
     var STATS_TAB_META = {
-        overview: { title: 'VUE D’ENSEMBLE', sub: 'État général de tes relais de flux' },
-        relais: { title: 'RELAIS', sub: 'Classement et utilisation des proxys' },
+        overview: { title: 'VUE D’ENSEMBLE', sub: 'Ton activité Twitch et l\'état de tes proxys en un coup d\'œil' },
+        relais: { title: 'PROXYS', sub: 'Classement et utilisation de tes proxys' },
         streamers: { title: 'STREAMERS', sub: 'Statistiques par chaîne regardée' },
         habitudes: { title: 'HABITUDES', sub: 'Quand est-ce que tu regardes Twitch ?' },
         sauvegarde: { title: 'SAUVEGARDE', sub: 'Mettre tes statistiques à l\'abri d\'un nettoyage de navigateur' },
         logs: { title: 'LOGS', sub: 'Journal des événements du script' }
     };
+
+    // ------------------------------------------------------------
+    // RAFRAÎCHISSEMENT SANS RECONSTRUCTION
+    // ------------------------------------------------------------
+    //
+    // Le dashboard se rafraîchit dès que les données changent — donc
+    // toutes les quelques secondes pendant un stream, puisque
+    // l'onglet qui lit écrit ses stats en continu. Avant, chaque
+    // rafraîchissement faisait `content.innerHTML = ...` : tout
+    // l'onglet était détruit puis reconstruit, à chaque fois.
+    //
+    // Ce que ça coûtait, visiblement :
+    //   - une micro-saccade (des centaines de nœuds recréés) ;
+    //   - le halo qui saute : --mx / --my sont écrits SUR l'élément
+    //     survolé, son remplaçant ne les a pas, la lumière repart
+    //     donc au centre et le fondu du ::after rejoue ;
+    //   - l'infobulle qui décroche (rattrapée après coup par
+    //     refreshTooltipAnchor) ;
+    //   - le graphique SVG entièrement redessiné pour rien.
+    //
+    // Maintenant on rend le nouvel état DANS UN CONTENEUR DÉTACHÉ,
+    // puis on reporte sur l'affichage réel uniquement ce qui diffère :
+    // les textes et les attributs. Les éléments survolés ne sont
+    // jamais détruits — donc plus rien à recoller après coup, et la
+    // fréquence de rafraîchissement n'est pas touchée.
+    //
+    // Si la structure a bougé pour de bon (une ligne apparaît, un
+    // onglet change), la comparaison échoue franchement et on
+    // retombe sur la reconstruction complète d'avant.
+
+    // Contenu géré hors des fonctions de rendu : le graphique est
+    // dessiné par renderWatchTimeChartSVG, qui a besoin d'une
+    // largeur réelle. Dans le rendu en coulisse il reste donc vide —
+    // le recopier effacerait le vrai. On n'y touche pas du tout,
+    // attributs compris : la classe tp9s-chart-hovering y est posée
+    // par le survol et serait sinon retirée sous le curseur.
+    var DOM_PATCH_OPAQUE = 'tp9s-chart-canvas';
+
+    function patchElementAttributes(live, next) {
+
+        // La position du halo vit dans le style en ligne, écrite par
+        // attachSpotlight. Recopier l'attribut style l'effacerait :
+        // c'est exactement le saut qu'on cherche à supprimer.
+        var mx = live.style && live.style.getPropertyValue('--mx');
+        var my = live.style && live.style.getPropertyValue('--my');
+
+        var i;
+        var attr;
+
+        for (i = next.attributes.length - 1; i >= 0; i--) {
+
+            attr = next.attributes[i];
+
+            if (live.getAttribute(attr.name) !== attr.value) {
+                live.setAttribute(attr.name, attr.value);
+            }
+
+        }
+
+        for (i = live.attributes.length - 1; i >= 0; i--) {
+
+            attr = live.attributes[i];
+
+            if (!next.hasAttribute(attr.name)) {
+                live.removeAttribute(attr.name);
+            }
+
+        }
+
+        if (mx) {
+            live.style.setProperty('--mx', mx);
+        }
+
+        if (my) {
+            live.style.setProperty('--my', my);
+        }
+
+    }
+
+    // Renvoie false dès que les deux arbres divergent structurellement.
+    // L'affichage peut alors être à moitié mis à jour : sans
+    // importance, l'appelant reconstruit tout derrière.
+    function patchDOMInPlace(live, next) {
+
+        if (live.childNodes.length !== next.childNodes.length) {
+            return false;
+        }
+
+        for (var i = 0; i < live.childNodes.length; i++) {
+
+            var a = live.childNodes[i];
+            var b = next.childNodes[i];
+
+            if (a.nodeType !== b.nodeType) {
+                return false;
+            }
+
+            if (a.nodeType === 3) {
+
+                if (a.nodeValue !== b.nodeValue) {
+                    a.nodeValue = b.nodeValue;
+                }
+
+                continue;
+
+            }
+
+            if (a.nodeType !== 1) {
+                continue;
+            }
+
+            if (a.tagName !== b.tagName) {
+                return false;
+            }
+
+            if (
+                a.classList &&
+                a.classList.contains(DOM_PATCH_OPAQUE)
+            ) {
+                continue;
+            }
+
+            patchElementAttributes(a, b);
+
+            if (!patchDOMInPlace(a, b)) {
+                return false;
+            }
+
+        }
+
+        return true;
+
+    }
+
+    // Empreinte de ce que la vague AFFICHE réellement : c'est la
+    // seule chose qui justifie de la redessiner.
+    function currentChartSignature() {
+
+        if (statsActiveTab !== 'overview') {
+            return null;
+        }
+
+        return (
+            statsChartMetric + '|' + statsWatchChartRange + '|' +
+            getChartBuckets(statsWatchChartRange, statsChartMetric)
+                .map(function (bucket) {
+                    return bucket.ms;
+                })
+                .join(',')
+        );
+
+    }
+
+    var lastRenderedHTML = null;
+    var lastChartSignature = null;
+
+    function renderStatsTabInto(target) {
+
+        if (statsActiveTab === 'overview') {
+            renderStatsOverview(target);
+        } else if (statsActiveTab === 'relais') {
+            renderStatsRelais(target);
+        } else if (statsActiveTab === 'streamers') {
+            renderStatsStreamers(target);
+        } else if (statsActiveTab === 'habitudes') {
+            renderStatsHabitudes(target);
+        } else if (statsActiveTab === 'sauvegarde') {
+            renderStatsBackup(target);
+        } else if (statsActiveTab === 'logs') {
+            renderStatsLogs(target);
+        }
+
+    }
+
+    function updateStatsContentInPlace(content) {
+
+        var staging = document.createElement('div');
+
+        renderStatsTabInto(staging);
+
+        var html = staging.innerHTML;
+
+        // Rien de visible n'a changé : la plupart des écritures de
+        // stats ne déplacent aucun chiffre de l'onglet affiché.
+        if (html === lastRenderedHTML) {
+            return;
+        }
+
+        lastRenderedHTML = html;
+
+        if (!patchDOMInPlace(content, staging)) {
+
+            var scrollTop = content.scrollTop;
+
+            // Reconstruction complète : un champ en cours de saisie
+            // (la recherche dans les logs) perdrait le focus et le
+            // curseur en plein milieu d'un mot. On les note pour les
+            // rendre au champ recréé.
+            var focused = document.activeElement;
+
+            var focusKey =
+                focused &&
+                focused.getAttribute &&
+                focused.getAttribute('data-tp9-keep-focus');
+
+            var caret = focusKey ? focused.selectionStart : null;
+
+            renderStatsTabInto(content);
+
+            if (focusKey) {
+
+                var restored = content.querySelector(
+                    '[data-tp9-keep-focus="' + focusKey + '"]'
+                );
+
+                if (restored) {
+
+                    restored.focus();
+
+                    try {
+                        restored.setSelectionRange(caret, caret);
+                    } catch (e) {}
+
+                }
+
+            }
+
+            content.scrollTop = scrollTop;
+
+            lastChartSignature = currentChartSignature();
+
+            // Reconstruction complète : l'élément survolé a bien été
+            // détruit, il faut raccrocher l'infobulle à son
+            // remplaçant.
+            refreshTooltipAnchor();
+
+            return;
+
+        }
+
+        var signature = currentChartSignature();
+
+        if (signature !== lastChartSignature) {
+
+            lastChartSignature = signature;
+
+            renderWatchTimeChartSVG(
+                content.querySelector('.tp9s-chart-canvas')
+            );
+
+        }
+
+    }
+
+    // Le débit ne transite pas par les statistiques : aucune
+    // écriture localStorage ne vient donc déclencher la resynchro
+    // habituelle. On redessine quand — et seulement quand — le texte
+    // affiché changerait, y compris pour le faire DISPARAÎTRE quand
+    // la lecture s'arrête (plus aucun message n'arrive alors : d'où
+    // le minuteur, qui est le seul à pouvoir constater la péremption).
+    var lastThroughputText = null;
+
+    function refreshLiveThroughput() {
+
+        if (!statsDashboardVisible || statsActiveTab !== 'overview') {
+            return;
+        }
+
+        var text = formatThroughput(getTotalLiveThroughputBps());
+
+        if (text === lastThroughputText) {
+            return;
+        }
+
+        lastThroughputText = text;
+
+        renderStatsDashboard(true);
+
+    }
 
     function renderStatsDashboard(silent) {
 
@@ -13095,39 +14916,24 @@ dashboardButton.style.visibility =
 
         var content = statsDashboard.querySelector('.tp9s-content');
 
-        // Remplacer innerHTML réinitialise le scroll du conteneur :
-        // on le restaure après coup pour un refresh silencieux
-        // (sinon la liste "saute" en haut à chaque resynchro).
-        var scrollTop = silent ? content.scrollTop : 0;
-
-        if (statsActiveTab === 'overview') {
-            renderStatsOverview(content);
-        } else if (statsActiveTab === 'relais') {
-            renderStatsRelais(content);
-        } else if (statsActiveTab === 'streamers') {
-            renderStatsStreamers(content);
-        } else if (statsActiveTab === 'habitudes') {
-            renderStatsHabitudes(content);
-        } else if (statsActiveTab === 'sauvegarde') {
-            renderStatsBackup(content);
-        } else if (statsActiveTab === 'logs') {
-            renderStatsLogs(content);
-        }
-
+        // Resynchro entre onglets : mise à jour sur place, sans
+        // détruire ce qui est sous le curseur. Voir le commentaire
+        // de updateStatsContentInPlace.
         if (silent) {
 
-            // Refresh en arrière-plan (resynchro entre onglets) :
-            // aucune animation, aucun saut de scroll, pour rester
-            // invisible pour l'utilisateur.
-            content.scrollTop = scrollTop;
-
-            // L'élément survolé vient d'être détruit et recréé :
-            // on raccroche la bulle à son remplaçant.
-            refreshTooltipAnchor();
+            updateStatsContentInPlace(content);
 
             return;
 
         }
+
+        renderStatsTabInto(content);
+
+        // Reconstruction complète : la dernière empreinte connue ne
+        // correspond plus à rien de comparable (le graphique vient
+        // d'être dessiné pour de vrai, pas en coulisse).
+        lastRenderedHTML = null;
+        lastChartSignature = currentChartSignature();
 
         // Petite animation d'entrée à chaque changement d'onglet /
         // rafraîchissement manuel, pour un rendu plus vivant.
@@ -13140,7 +14946,9 @@ dashboardButton.style.visibility =
     // navTab (optionnel) : onglet vers lequel la carte navigue au
     // clic ("relais" / "streamers"). historyChannel (optionnel) :
     // en plus de naviguer, ouvre l'historique tchat de ce channel.
-    function statCard(icon, label, value, sub, accent, navTab, historyChannel) {
+    // badge (optionnel, en dernier) : petit HTML déjà échappé, posé
+    // à gauche de l'icône — sert à la pastille de débit en direct.
+    function statCard(icon, label, value, sub, accent, navTab, historyChannel, badge) {
 
         var navAttrs = navTab
             ? ' data-nav="' + escapeHTML(navTab) + '"' +
@@ -13153,7 +14961,10 @@ dashboardButton.style.visibility =
                 ' style="--accent:' + (accent || '#9147ff') + '">' +
                 '<div class="tp9s-card-top">' +
                     '<div class="tp9s-card-label">' + escapeHTML(label) + '</div>' +
-                    '<div class="tp9s-card-icon">' + icon + '</div>' +
+                    '<div class="tp9s-card-top-right">' +
+                        (badge || '') +
+                        '<div class="tp9s-card-icon">' + icon + '</div>' +
+                    '</div>' +
                 '</div>' +
                 '<div class="tp9s-card-value">' + escapeHTML(String(value)) + '</div>' +
                 '<div class="tp9s-card-sub">' + escapeHTML(sub || '') + '</div>' +
@@ -13747,6 +15558,15 @@ dashboardButton.style.visibility =
             return;
         }
 
+        // Conteneur hors document : c'est le rendu en coulisse de
+        // updateStatsContentInPlace(). Il n'a aucune largeur à
+        // mesurer, et la nouvelle tentative programmée plus bas
+        // tournerait en boucle sur un nœud que personne ne verra
+        // jamais. Le vrai graphique, lui, est redessiné à part.
+        if (container.isConnected === false) {
+            return;
+        }
+
         var chartWidth = Math.round(container.clientWidth || 0);
 
         if (!chartWidth) {
@@ -13993,6 +15813,16 @@ dashboardButton.style.visibility =
 
         var activeCount = pageConfig.proxies.filter(function (p) { return p.enabled; }).length;
 
+        // Débit en cours, tous onglets qui lisent confondus. Null
+        // dès qu'aucun n'a rien téléchargé depuis 20 s : la pastille
+        // disparaît alors au lieu d'afficher une valeur morte.
+        var liveThroughputText =
+            formatThroughput(getTotalLiveThroughputBps());
+
+        var directPlaybacks = getDirectPlaybacks7d();
+
+        var lastDirect = directPlaybacks[directPlaybacks.length - 1];
+
         var topWatchedAvatar = topWatched ? getStreamerAvatarUrl(topWatched.channel) : null;
         var topChattedAvatar = topChatted ? getStreamerAvatarUrl(topChatted.channel) : null;
 
@@ -14034,8 +15864,16 @@ dashboardButton.style.visibility =
                 '📶',
                 'BANDE PASSANTE TOTALE',
                 formatBytes(pageStats.totals.bandwidthBytesGlobal),
-                bandwidthSourceLabel() + ' • total consommé, pas le débit actuel',
-                '#1f9cf0'
+                bandwidthSourceLabel() + ' • cumulé depuis le début',
+                '#1f9cf0',
+                null,
+                null,
+                liveThroughputText
+                    ? '<span class="tp9s-card-live">' +
+                        '<span class="tp9s-card-live-dot"></span>' +
+                        escapeHTML(liveThroughputText) +
+                      '</span>'
+                    : ''
             ),
 
             statCard(
@@ -14045,6 +15883,23 @@ dashboardButton.style.visibility =
                 'mesuré · lecture réelle • cumulé sur tous les streamers',
                 '#bf94ff',
                 'streamers'
+            ),
+
+            // La seule carte qui dise si le script a fait son
+            // travail : chaque passage en direct est un moment où
+            // les pubs ont pu revenir. Vert tant qu'il n'y en a
+            // aucun, ambre dès le premier.
+            statCard(
+                directPlaybacks.length ? '⚠️' : '🛡️',
+                'PASSAGES EN DIRECT (7J)',
+                directPlaybacks.length,
+                directPlaybacks.length
+                    ? 'dernier ' + formatSessionDate(lastDirect.t) +
+                        (lastDirect.tried
+                            ? ' · ' + lastDirect.tried + ' proxys tentés'
+                            : '')
+                    : 'aucun · les proxys ont toujours tenu',
+                directPlaybacks.length ? '#ffcf7a' : '#00d084'
             )
 
         ].join('');
@@ -14082,7 +15937,7 @@ dashboardButton.style.visibility =
 
             statCard(
                 '📡',
-                'RELAIS ACTIFS',
+                'PROXYS ACTIFS',
                 activeCount,
                 'sur ' + pageConfig.proxies.length + ' configurés',
                 '#9147ff',
@@ -14133,10 +15988,10 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
                     <div>
-                        <div class="tp9s-panel-title">Meilleurs relais (7 jours)</div>
+                        <div class="tp9s-panel-title">Meilleurs proxys (7 jours)</div>
                         <div class="tp9s-panel-sub">Score combinant le taux de réussite et la latence moyenne</div>
                     </div>
-                    <button type="button" class="tp9s-panel-link" data-nav="relais">Voir tous les relais →</button>
+                    <button type="button" class="tp9s-panel-link" data-nav="relais">Voir tous les proxys →</button>
                 </div>
                 <div class="tp9s-lead-list">
                     ${
@@ -14221,6 +16076,70 @@ dashboardButton.style.visibility =
 
     }
 
+    // ------------------------------------------------------------
+    // MICRO-COURBE DE LATENCE (tableau Proxys)
+    // ------------------------------------------------------------
+    //
+    // proxyHistory garde déjà 7 jours de tests et on n'en sortait
+    // qu'une moyenne — or une moyenne noie exactement ce qu'on veut
+    // voir : un proxy qui se dégrade lentement avant de tomber en
+    // quarantaine. L'échelle est LOCALE à chaque proxy (min/max de sa
+    // propre série) : la courbe montre une tendance, pas un niveau,
+    // le niveau est déjà donné par le nombre juste à côté.
+    //
+    // La latence monte vers le HAUT : une courbe qui grimpe = un
+    // proxy qui ralentit.
+
+    var SPARK_W = 46;
+    var SPARK_H = 15;
+
+    function sparklineSVG(values, color) {
+
+        if (!values || values.length < 2) {
+            return '';
+        }
+
+        var min = Math.min.apply(null, values);
+        var max = Math.max.apply(null, values);
+
+        // Série parfaitement plate : sans ce garde, la division
+        // donnerait NaN et le tracé disparaîtrait.
+        var span = (max - min) || 1;
+
+        var points = values.map(function (value, index) {
+
+            var x = (SPARK_W * index) / (values.length - 1);
+
+            var y =
+                (SPARK_H - 1.5) -
+                ((value - min) / span) * (SPARK_H - 3);
+
+            return (
+                (Math.round(x * 10) / 10) + ',' +
+                (Math.round(y * 10) / 10)
+            );
+
+        }).join(' ');
+
+        return (
+            '<span class="tp9s-spark-wrap"' +
+                ' data-tp9-tip="Tendance de la latence"' +
+                ' data-tp9-tip-sub="' + values.length +
+                ' derniers tests réussis · vers le haut = plus lent">' +
+                '<svg class="tp9s-spark" width="' + SPARK_W +
+                    '" height="' + SPARK_H +
+                    '" viewBox="0 0 ' + SPARK_W + ' ' + SPARK_H +
+                    '" aria-hidden="true">' +
+                    '<polyline points="' + points +
+                        '" fill="none" stroke="' + color +
+                        '" stroke-width="1.5" stroke-linecap="round"' +
+                        ' stroke-linejoin="round"/>' +
+                '</svg>' +
+            '</span>'
+        );
+
+    }
+
     function initialLetter(text) {
 
         return escapeHTML((text || '?').charAt(0).toUpperCase());
@@ -14239,6 +16158,7 @@ dashboardButton.style.visibility =
     var RELAIS_SORT_DEFAULT_DIR = {
         score: 'desc',
         avgLatency: 'asc',
+        liveLatency: 'asc',
         successRate: 'desc',
         testCount: 'desc',
         usage: 'desc',
@@ -14334,6 +16254,100 @@ dashboardButton.style.visibility =
 
         });
 
+        // ---- cartes ----
+
+        var cutoff7d = Date.now() - STATS_HISTORY_MS;
+
+        var totalTests = 0;
+        var totalOk = 0;
+
+        pageConfig.proxies.forEach(function (proxy) {
+
+            (pageStats.proxyHistory[proxy.id] || []).forEach(function (entry) {
+
+                if (entry.t < cutoff7d) {
+                    return;
+                }
+
+                totalTests++;
+
+                if (entry.ok) {
+                    totalOk++;
+                }
+
+            });
+
+        });
+
+        var globalRate = totalTests
+            ? Math.round((totalOk / totalTests) * 100)
+            : null;
+
+        var quarantined = pageConfig.proxies.filter(function (proxy) {
+            return proxy.quarantine;
+        }).length;
+
+        // Le mieux classé pour lequel on a LES DEUX latences : c'est
+        // le seul cas où la comparaison veut dire quelque chose.
+        var gapProxy = ranking.filter(function (item) {
+            return item.avgLatency !== null && item.liveLatency !== null;
+        })[0] || null;
+
+        var gapMs = gapProxy
+            ? (gapProxy.liveLatency - gapProxy.avgLatency)
+            : null;
+
+        var leader = ranking[0] && ranking[0].score !== null ? ranking[0] : null;
+
+        var proxyCards = [
+
+            statCard(
+                '🥇',
+                'PROXY EN TÊTE',
+                leader ? leader.name : '—',
+                leader
+                    ? 'score ' + leader.score + ' · ' + leader.avgLatency + ' ms'
+                    : 'aucun test récent',
+                '#bf94ff'
+            ),
+
+            statCard(
+                '🎯',
+                'RÉUSSITE GLOBALE (7J)',
+                globalRate !== null ? globalRate + ' %' : '—',
+                totalTests
+                    ? totalOk + ' réussis sur ' + totalTests + ' tests'
+                    : 'aucun test sur la période',
+                globalRate === null || globalRate >= 80
+                    ? '#00d084'
+                    : (globalRate >= 50 ? '#ffcf7a' : '#ff6b6b')
+            ),
+
+            statCard(
+                '💤',
+                'EN QUARANTAINE',
+                quarantined,
+                'sur ' + pageConfig.proxies.length + ' proxys configurés',
+                quarantined ? '#ffcf7a' : '#00d084'
+            ),
+
+            // Deux mesures du même proxy : si elles s'écartent, c'est
+            // que les tests ne racontent pas ce que la lecture subit
+            // vraiment.
+            statCard(
+                '⚖️',
+                'ÉCART TEST ↔ RÉEL',
+                gapMs === null
+                    ? '—'
+                    : (gapMs > 0 ? '+' : '') + gapMs + ' ms',
+                gapProxy
+                    ? gapProxy.name + ' · positif = plus lent en vrai'
+                    : 'il faut les deux mesures sur un même proxy',
+                '#4fc3f7'
+            )
+
+        ].join('');
+
         var rows = sorted.map(function (p, index) {
 
             var rateCls = successRateClass(p.successRate);
@@ -14347,7 +16361,7 @@ dashboardButton.style.visibility =
                         (
                             p.quarantined
                                 ? '<span class="tp9s-quarantine-badge"' +
-                                    ' data-tp9-tip="Relais en quarantaine"' +
+                                    ' data-tp9-tip="Proxy en quarantaine"' +
                                     ' data-tp9-tip-sub="Aucune réponse depuis des jours : écarté de' +
                                     ' la course, mais re-testé automatiquement toutes les heures.">💤</span>'
                                 : ''
@@ -14356,8 +16370,14 @@ dashboardButton.style.visibility =
                     '<div class="tp9s-td tp9s-td-score">' +
                         (p.score !== null ? p.score : '—') +
                     '</div>' +
-                    '<div class="tp9s-td" style="color:' + latencyColor(p.avgLatency) + ';font-weight:700;">' +
-                        (p.avgLatency !== null ? p.avgLatency + ' ms' : '—') +
+                    '<div class="tp9s-td tp9s-td-latency" style="color:' + latencyColor(p.avgLatency) + ';">' +
+                        '<span>' +
+                            (p.avgLatency !== null ? p.avgLatency + ' ms' : '—') +
+                        '</span>' +
+                        sparklineSVG(p.latencySeries, latencyColor(p.avgLatency)) +
+                    '</div>' +
+                    '<div class="tp9s-td tp9s-td-live" style="color:' + latencyColor(p.liveLatency) + ';">' +
+                        (p.liveLatency !== null ? p.liveLatency + ' ms' : '—') +
                     '</div>' +
                     '<div class="tp9s-td tp9s-td-flex">' +
                         (
@@ -14380,16 +16400,23 @@ dashboardButton.style.visibility =
 
         content.innerHTML = `
 
+            <div class="tp9s-cards">${proxyCards}</div>
+
             <div class="tp9s-panel">
-                <div class="tp9s-panel-title">Classement des relais</div>
-                <div class="tp9s-panel-sub">Score = réussite pondérée par la latence, sur les 7 derniers jours · clique un en-tête pour trier</div>
+                <div class="tp9s-panel-title">Classement des proxys</div>
+                <div class="tp9s-panel-sub">
+                    Score = réussite pondérée par la latence, sur les 7 derniers jours ·
+                    « latence test » = mesurée par les tests automatiques, « latence réelle » =
+                    subie pendant la lecture · clique un en-tête pour trier
+                </div>
 
                 <div class="tp9s-table">
                     <div class="tp9s-table-row tp9s-table-row-relais tp9s-table-head">
                         <div class="tp9s-td"></div>
                         <div class="tp9s-td tp9s-td-name">Proxy</div>
                         ${sortableHeaderHTML('Score', 'relais', 'score', key, dir)}
-                        ${sortableHeaderHTML('Latence 7j', 'relais', 'avgLatency', key, dir)}
+                        ${sortableHeaderHTML('Latence test', 'relais', 'avgLatency', key, dir)}
+                        ${sortableHeaderHTML('Latence réelle', 'relais', 'liveLatency', key, dir)}
                         ${sortableHeaderHTML('Réussite', 'relais', 'successRate', key, dir)}
                         ${sortableHeaderHTML('Tests 7j', 'relais', 'testCount', key, dir)}
                         ${sortableHeaderHTML('Utilisations', 'relais', 'usage', key, dir)}
@@ -14425,6 +16452,93 @@ dashboardButton.style.visibility =
         var maxBandwidth = channels.reduce(function (max, channel) {
             return Math.max(max, pageStats.streamers[channel].bandwidthBytes);
         }, 0);
+
+        // ---- cartes ----
+
+        var weekCutoff = Date.now() - STATS_HISTORY_MS;
+
+        var seenThisWeek = channels.filter(function (channel) {
+            return (pageStats.streamers[channel].lastSeen || 0) >= weekCutoff;
+        }).length;
+
+        // Seuls ceux réellement regardés : une fiche à 0 minute
+        // tirerait la moyenne vers le bas sans rien vouloir dire.
+        var watchedChannels = channels.filter(function (channel) {
+            return pageStats.streamers[channel].watchTimeMs > 0;
+        });
+
+        var totalWatchMs = watchedChannels.reduce(function (acc, channel) {
+            return acc + pageStats.streamers[channel].watchTimeMs;
+        }, 0);
+
+        var top3Ms = watchedChannels
+            .map(function (channel) {
+                return pageStats.streamers[channel].watchTimeMs;
+            })
+            .sort(function (a, b) {
+                return b - a;
+            })
+            .slice(0, 3)
+            .reduce(function (acc, ms) {
+                return acc + ms;
+            }, 0);
+
+        var concentration = totalWatchMs
+            ? Math.round((top3Ms / totalWatchMs) * 100)
+            : null;
+
+        // Messages envoyés par heure réellement regardée : la seule
+        // façon de comparer deux périodes de durées différentes.
+        var chatPerHour = totalWatchMs
+            ? Math.round(
+                (pageStats.totals.chatMessagesGlobal /
+                    (totalWatchMs / 3600000)) * 10
+              ) / 10
+            : null;
+
+        var streamerCards = [
+
+            statCard(
+                '🎥',
+                'STREAMERS SUIVIS',
+                channels.length,
+                seenThisWeek + ' vu(s) ces 7 derniers jours',
+                '#9147ff'
+            ),
+
+            statCard(
+                '🕒',
+                'TEMPS MOYEN PAR STREAMER',
+                watchedChannels.length
+                    ? formatDuration(Math.round(totalWatchMs / watchedChannels.length))
+                    : '—',
+                watchedChannels.length
+                    ? 'sur ' + watchedChannels.length + ' streamer(s) regardé(s)'
+                    : 'aucun visionnage enregistré',
+                '#bf94ff'
+            ),
+
+            statCard(
+                '🎯',
+                'CONCENTRATION',
+                concentration !== null ? concentration + ' %' : '—',
+                concentration !== null
+                    ? 'de ton temps sur tes 3 streamers préférés'
+                    : 'aucun visionnage enregistré',
+                '#ff9d4d'
+            ),
+
+            statCard(
+                '💬',
+                'BAVARDAGE',
+                chatPerHour !== null ? chatPerHour : '—',
+                chatPerHour !== null
+                    ? 'messages envoyés par heure regardée'
+                    : 'aucun visionnage enregistré',
+                '#ff8fd6'
+            )
+
+        ].join('');
 
         var AVATAR_COLORS = ['#9147ff', '#00d084', '#4fc3f7', '#ff8fd6', '#ffcf7a', '#ff6b6b'];
 
@@ -14511,6 +16625,8 @@ dashboardButton.style.visibility =
         }).join('');
 
         content.innerHTML = `
+
+            <div class="tp9s-cards">${streamerCards}</div>
 
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
@@ -14807,6 +16923,36 @@ dashboardButton.style.visibility =
 
     }
 
+    // "sam. 19/09" — la date SANS l'heure. formatSessionDate, qui
+    // colle les deux, faisait passer la colonne sur deux lignes dans
+    // le tableau des sessions ; ici l'heure est affichée à part,
+    // sous forme de plage début → fin, ce qui dit bien plus que la
+    // seule heure de démarrage.
+    function formatSessionDay(timestamp) {
+
+        try {
+
+            return new Date(timestamp).toLocaleDateString(
+                [],
+                { weekday: 'short', day: '2-digit', month: '2-digit' }
+            );
+
+        } catch (e) {
+
+            return '—';
+
+        }
+
+    }
+
+    function formatClock(timestamp) {
+
+        var date = new Date(timestamp);
+
+        return pad2(date.getHours()) + ':' + pad2(date.getMinutes());
+
+    }
+
     function renderStatsHabitudes(content) {
 
         var sessionStats = getSessionStats();
@@ -15001,13 +17147,26 @@ dashboardButton.style.visibility =
                 ? Math.max(4, Math.round((s.ms / sessionStats.longest.ms) * 100))
                 : 0;
 
+            // Même code couleur que la répartition par jour de la
+            // semaine juste en dessous : d'un panneau à l'autre, un
+            // mardi reste bleu.
+            var color = WEEKDAY_COLORS[new Date(s.start).getDay()];
+
             return (
                 '<div class="tp9s-bar-row tp9s-session-row">' +
-                    '<div>' + escapeHTML(formatSessionDate(s.start)) + '</div>' +
-                    '<div class="tp9s-bar-track">' +
-                        '<div class="tp9s-bar-fill" style="width:' + percent + '%"></div>' +
+                    '<div class="tp9s-bar-label">' +
+                        '<span class="tp9s-bar-dot" style="background:' + color + '"></span>' +
+                        escapeHTML(formatSessionDay(s.start)) +
                     '</div>' +
-                    '<div class="tp9s-bar-value">' +
+                    '<div class="tp9s-bar-range">' +
+                        escapeHTML(formatClock(s.start)) + ' → ' +
+                        escapeHTML(formatClock(s.end)) +
+                    '</div>' +
+                    '<div class="tp9s-bar-track">' +
+                        '<div class="tp9s-bar-fill" style="width:' + percent +
+                            '%;--bar:' + color + '"></div>' +
+                    '</div>' +
+                    '<div class="tp9s-bar-value" style="color:' + color + '">' +
                         escapeHTML(formatDuration(s.ms)) +
                     '</div>' +
                 '</div>'
@@ -15021,16 +17180,31 @@ dashboardButton.style.visibility =
             return Math.max(acc, ms);
         }, 0);
 
+        var weekdayTotal = weekdayTotals.reduce(function (acc, ms) {
+            return acc + ms;
+        }, 0);
+
         var weekdayRows = HEATMAP_DAY_ORDER.map(function (day) {
 
             var ms = weekdayTotals[day];
 
             var percent = weekdayMax ? Math.round((ms / weekdayMax) * 100) : 0;
 
+            // Les barres sont à l'échelle du jour le plus chargé :
+            // quand tous les jours se ressemblent, elles paraissent
+            // toutes pleines et ne disent plus rien. La part du
+            // total, elle, donne le point de repère qui manquait.
+            var share = weekdayTotal
+                ? Math.round((ms / weekdayTotal) * 100)
+                : 0;
+
             var color = WEEKDAY_COLORS[day];
 
             return (
-                '<div class="tp9s-bar-row">' +
+                '<div class="tp9s-bar-row tp9s-weekday-row' +
+                        (ms ? '' : ' tp9s-bar-empty') +
+                        (ms && ms === weekdayMax ? ' tp9s-bar-top' : '') +
+                        '">' +
                     '<div class="tp9s-bar-label">' +
                         '<span class="tp9s-bar-dot" style="background:' + color + '"></span>' +
                         escapeHTML(DAY_LABELS_FULL[day]) +
@@ -15041,6 +17215,9 @@ dashboardButton.style.visibility =
                     '</div>' +
                     '<div class="tp9s-bar-value" style="color:' + color + '">' +
                         escapeHTML(formatDuration(ms)) +
+                    '</div>' +
+                    '<div class="tp9s-bar-pct">' +
+                        (ms ? share + ' %' : '—') +
                     '</div>' +
                 '</div>'
             );
@@ -15070,8 +17247,12 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title">Dernières sessions</div>
                 <div class="tp9s-panel-sub">
-                    Un bloc de visionnage continu : plus de 10 minutes d'interruption
-                    et une nouvelle session commence
+                    Tes 10 derniers blocs de visionnage continu · la barre compare
+                    chacun à ta plus longue session (${escapeHTML(
+                        sessionStats.longest
+                            ? formatDuration(sessionStats.longest.ms)
+                            : '—'
+                    )})
                 </div>
 
                 ${
@@ -15083,8 +17264,9 @@ dashboardButton.style.visibility =
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title">Répartition par jour de la semaine</div>
                 <div class="tp9s-panel-sub">
-                    Basée sur tout l'historique journalier conservé (jusqu'à un an), pas
-                    seulement sur la carte ci-dessus
+                    ${escapeHTML(formatDuration(weekdayTotal))} au total sur tout
+                    l'historique conservé (jusqu'à un an) · la barre compare au jour
+                    le plus chargé, le pourcentage donne la part du total
                 </div>
 
                 ${
@@ -15481,9 +17663,79 @@ dashboardButton.style.visibility =
         error: { icon: '⛔', cls: 'tp9s-log-error' }
     };
 
-    function renderStatsLogs(content) {
+    // 300 entrées sans filtre, c'est un mur : on trie par niveau et
+    // par texte. Les deux filtres se combinent, et les compteurs des
+    // boutons de niveau tiennent compte de la recherche en cours —
+    // sinon ils annonceraient des résultats que le filtre texte
+    // écarte.
 
-        var rows = pageStats.logs.map(function (entry) {
+    var LOG_FILTER_LEVELS = [
+        { id: 'all', label: 'Tous' },
+        { id: 'info', label: 'ℹ️' },
+        { id: 'success', label: '✅' },
+        { id: 'warn', label: '⚠️' },
+        { id: 'error', label: '⛔' }
+    ];
+
+    var statsLogLevel = 'all';
+    var statsLogQuery = '';
+
+    function getQueryFilteredLogs() {
+
+        var query = statsLogQuery.trim().toLowerCase();
+
+        if (!query) {
+            return pageStats.logs;
+        }
+
+        return pageStats.logs.filter(function (entry) {
+            return String(entry.msg).toLowerCase().indexOf(query) !== -1;
+        });
+
+    }
+
+    function getFilteredLogs() {
+
+        if (statsLogLevel === 'all') {
+            return getQueryFilteredLogs();
+        }
+
+        return getQueryFilteredLogs().filter(function (entry) {
+            return (entry.level || 'info') === statsLogLevel;
+        });
+
+    }
+
+    function countLogsForLevel(levelId) {
+
+        var entries = getQueryFilteredLogs();
+
+        if (levelId === 'all') {
+            return entries.length;
+        }
+
+        return entries.filter(function (entry) {
+            return (entry.level || 'info') === levelId;
+        }).length;
+
+    }
+
+    function logCountLabel(shown) {
+
+        if (shown === pageStats.logs.length) {
+            return pageStats.logs.length + ' événement(s) enregistré(s)';
+        }
+
+        return (
+            shown + ' événement(s) affiché(s) sur ' +
+            pageStats.logs.length
+        );
+
+    }
+
+    function buildLogRowsHTML(entries) {
+
+        return entries.map(function (entry) {
 
             var meta = LOG_LEVEL_META[entry.level] || LOG_LEVEL_META.info;
 
@@ -15502,21 +17754,113 @@ dashboardButton.style.visibility =
 
         }).join('');
 
+    }
+
+    // Change juste la liste et les compteurs, sans toucher au champ
+    // de recherche : le reconstruire en pleine frappe ferait perdre
+    // le curseur à chaque lettre.
+    function refreshLogList() {
+
+        if (!statsDashboard) {
+            return;
+        }
+
+        var content = statsDashboard.querySelector('.tp9s-content');
+
+        var list = content.querySelector('.tp9s-logs');
+
+        if (!list) {
+            return;
+        }
+
+        var entries = getFilteredLogs();
+
+        list.innerHTML =
+            buildLogRowsHTML(entries) ||
+            '<div class="tp9s-empty">Aucun événement ne correspond.</div>';
+
+        var countEl = content.querySelector('.tp9s-log-count');
+
+        if (countEl) {
+            countEl.textContent = logCountLabel(entries.length);
+        }
+
+        content.querySelectorAll('.tp9s-log-level-btn').forEach(
+            function (button) {
+
+                var id = button.getAttribute('data-log-level');
+
+                button.classList.toggle(
+                    'tp9s-chart-range-active',
+                    id === statsLogLevel
+                );
+
+                var badge = button.querySelector('.tp9s-log-level-count');
+
+                if (badge) {
+                    badge.textContent = countLogsForLevel(id);
+                }
+
+            }
+        );
+
+        // L'affichage ne correspond plus au dernier rendu comparé :
+        // sans ça, la prochaine resynchro le croirait déjà à jour et
+        // ne rattraperait rien.
+        lastRenderedHTML = null;
+
+    }
+
+    function renderStatsLogs(content) {
+
+        var entries = getFilteredLogs();
+
+        var levelButtons = LOG_FILTER_LEVELS.map(function (level) {
+
+            return (
+                '<button type="button"' +
+                    ' class="tp9s-chart-range-btn tp9s-log-level-btn' +
+                    (level.id === statsLogLevel ? ' tp9s-chart-range-active' : '') +
+                    '" data-log-level="' + level.id + '">' +
+                    level.label +
+                    '<span class="tp9s-log-level-count">' +
+                        countLogsForLevel(level.id) +
+                    '</span>' +
+                '</button>'
+            );
+
+        }).join('');
+
         content.innerHTML = `
 
             <div class="tp9s-panel">
                 <div class="tp9s-panel-title-row">
                     <div>
                         <div class="tp9s-panel-title">Journal des événements</div>
-                        <div class="tp9s-panel-sub">${pageStats.logs.length} événement(s) enregistré(s)</div>
+                        <div class="tp9s-panel-sub tp9s-log-count">${escapeHTML(logCountLabel(entries.length))}</div>
                     </div>
                     <button type="button" class="tp9s-clear-logs">${trashIconSVG(13)} Vider les logs</button>
                 </div>
 
+                <div class="tp9s-log-filters">
+                    <div class="tp9s-chart-range">${levelButtons}</div>
+                    <input
+                        type="text"
+                        class="tp9s-log-search"
+                        data-tp9-keep-focus="logs"
+                        placeholder="Rechercher dans les messages…"
+                        value="${escapeHTML(statsLogQuery)}"
+                    >
+                </div>
+
                 <div class="tp9s-logs">
                     ${
-                        rows ||
-                        '<div class="tp9s-empty">Aucun événement pour le moment.</div>'
+                        buildLogRowsHTML(entries) ||
+                        '<div class="tp9s-empty">' +
+                            (pageStats.logs.length
+                                ? 'Aucun événement ne correspond.'
+                                : 'Aucun événement pour le moment.') +
+                        '</div>'
                     }
                 </div>
             </div>
@@ -15551,7 +17895,12 @@ dashboardButton.style.visibility =
             return;
         }
 
-        renderStatsLogs(statsDashboard.querySelector('.tp9s-content'));
+        // Même moteur que la resynchro entre onglets : un nouvel
+        // événement ne doit pas reconstruire tout le journal sous le
+        // curseur.
+        updateStatsContentInPlace(
+            statsDashboard.querySelector('.tp9s-content')
+        );
 
     }
 
@@ -16722,6 +19071,14 @@ dashboardButton.style.visibility =
                                                         proxyName: proxy.name,
                                                         channel: channel,
                                                         direct: false,
+
+                                                        // Temps reellement mis par CE proxy pour
+                                                        // rendre un manifest valide, pendant la
+                                                        // vraie lecture. A ne pas confondre avec
+                                                        // la latence des tests : celle-ci est
+                                                        // subie, l'autre est provoquee.
+                                                        latency: elapsed,
+
                                                         timestamp: Date.now()
                                                     });
 
@@ -16787,6 +19144,14 @@ dashboardButton.style.visibility =
                                     proxyName: null,
                                     channel: channel,
                                     direct: true,
+
+                                    // Combien de proxys ont ete mis en
+                                    // course avant d'abandonner : sans ca,
+                                    // "passage en direct" ne dit pas si
+                                    // c'est un proxy isole qui a lache ou
+                                    // toute la liste.
+                                    tried: enabled.length,
+
                                     timestamp: Date.now()
                                 });
 
@@ -16801,22 +19166,34 @@ dashboardButton.style.visibility =
                         }
 
 
-                        if (
-                            fallbackEnabled
-                        ) {
+                        // Repli refusé : on rend une erreur au
+                        // lecteur au lieu de laisser Twitch servir
+                        // le flux. C'est tout l'intérêt du réglage —
+                        // les deux branches appelaient jusqu'ici le
+                        // même fetch d'origine, donc le décocher ne
+                        // changeait rien et les pubs revenaient
+                        // quand même.
+                        if (!fallbackEnabled) {
 
-                            console.log(
-                                "[TwitchProxy] → Fallback Twitch"
+                            console.warn(
+                                "[TwitchProxy] Repli désactivé → lecture abandonnée"
                             );
 
-                            return __tp_originalFetch.call(
-                                this,
-                                input,
-                                init
+                            return new Response(
+                                "",
+                                {
+                                    status: 502,
+                                    statusText:
+                                        "TwitchProxy: aucun proxy disponible"
+                                }
                             );
 
                         }
 
+
+                        console.log(
+                            "[TwitchProxy] → Fallback Twitch"
+                        );
 
                         return __tp_originalFetch.call(
                             this,
@@ -17190,6 +19567,63 @@ dashboardButton.style.visibility =
     })();
 
 
+    // ------------------------------------------------------------
+    // RACCOURCI CLAVIER
+    // ------------------------------------------------------------
+    //
+    // Alt + P ouvre/ferme le menu. Alt volontairement : Twitch
+    // réserve les lettres seules à son lecteur (k, m, f, t, espace),
+    // et une combinaison avec Alt ne produit jamais de caractère —
+    // le raccourci marche donc même avec le curseur dans le tchat,
+    // ce qui est justement le cas le plus fréquent.
+
+    function setupMenuShortcut() {
+
+        document.addEventListener(
+            'keydown',
+            function (event) {
+
+                if (
+                    !event.altKey ||
+                    event.ctrlKey ||
+                    event.metaKey ||
+                    (event.key || '').toLowerCase() !== 'p'
+                ) {
+                    return;
+                }
+
+                // Pas de bouton visible = pas de menu à ouvrir
+                // (accueil, page sans lecteur, mini-player).
+                if (
+                    !dashboardButton ||
+                    dashboardButton.style.visibility === 'hidden'
+                ) {
+                    return;
+                }
+
+                event.preventDefault();
+
+                if (dashboardVisible) {
+                    hideDashboard();
+                } else {
+                    showDashboard();
+                }
+
+            },
+            true
+        );
+
+        // Échap ferme le menu, comme il ferme déjà le dashboard.
+        document.addEventListener('keydown', function (event) {
+
+            if (event.key === 'Escape' && dashboardVisible) {
+                hideDashboard();
+            }
+
+        });
+
+    }
+
     function initUI() {
 
         if (!document.body) {
@@ -17223,6 +19657,8 @@ dashboardButton.style.visibility =
         lastKnownChannel = getTestChannel();
 
         createPlayerButton();
+
+        setupMenuShortcut();
 
         // Applique tout de suite le badge si une mise à jour était
         // déjà connue depuis un check précédent (avant même le
