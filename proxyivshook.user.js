@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.5.2
+// @version      1.5.3
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -32,7 +32,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.5.2';
+    var CURRENT_VERSION = '1.5.3';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -172,19 +172,83 @@
     // ------------------------------------------------------------
 
     var PROXY_REGION_META = {
-        eu: { icon: '🇪🇺', accent: '#4fc3f7' },
-        na: { icon: '🇺🇸', accent: '#ff9d4d' },
-        as: { icon: '🌏', accent: '#00d084' },
-        sa: { icon: '🌎', accent: '#ff8fd6' }
+        eu: { icon: '🇪🇺', accent: '#4fc3f7', label: 'Europe' },
+        na: { icon: '🇺🇸', accent: '#ff9d4d', label: 'Amérique du Nord' },
+        as: { icon: '🌏', accent: '#00d084', label: 'Asie' },
+        sa: { icon: '🌎', accent: '#ff8fd6', label: 'Amérique du Sud' }
     };
 
-    // Basé sur l'id (ex: "perfprod-eu5", "luminous-as") plutôt que
-    // le nom, pour éviter les faux positifs ("Nadeko" contient "na").
+    // La région d'un relais ne se devine plus : elle est déclarée.
+    //
+    // L'ancienne version la déduisait du suffixe de l'id, et se
+    // trompait sur deux relais : lb-sa est à New York et sert du CDN
+    // nord-américain, as.luminous.dev est au Kazakhstan mais sert du
+    // CDN européen. Un nom d'hôte ne prouve rien.
+    //
+    // Deux champs parce qu'il y a deux faits, et qu'ils ne sont pas
+    // toujours d'accord :
+    //
+    //   cdn  — le CDN Twitch attaqué, donc d'où le flux sort vraiment.
+    //          C'est lui qui donne le drapeau, la couleur et le groupe.
+    //   host — le pays où le relais est hébergé, donc à qui TA connexion
+    //          parle, et ce qui explique une latence inattendue. null
+    //          quand le fournisseur répartit sur plusieurs pays.
+    var PROXY_META = {
+        'luminous-eu':  { cdn: 'eu', host: '🇷🇺 Russie' },
+        'luminous-eu2': { cdn: 'eu', host: '🇺🇦 Ukraine' },
+        'luminous-eu3': { cdn: 'eu', host: '🇧🇬 Bulgarie' },
+        'luminous-as':  { cdn: 'eu', host: '🇰🇿 Kazakhstan' },
+        'perfprod-eu':  { cdn: 'eu', host: null },
+        'perfprod-eu2': { cdn: 'eu', host: null },
+        'perfprod-eu3': { cdn: 'eu', host: '🇷🇺 Russie' },
+        'perfprod-eu4': { cdn: 'eu', host: null },
+        'perfprod-eu5': { cdn: 'eu', host: null },
+        'perfprod-na':  { cdn: 'na', host: '🇺🇸 Phoenix (Arizona)' },
+        'perfprod-as':  { cdn: 'as', host: null },
+        'perfprod-sa':  { cdn: 'na', host: '🇺🇸 New York' }
+    };
+
+
+    // Un relais absent de la table (Nadeko, ou un proxy perso) n'a
+    // pas de région : il garde son 📡 générique plutôt qu'un drapeau
+    // inventé.
     function getProxyRegion(proxy) {
 
-        var match = (proxy.id || '').toLowerCase().match(/-(eu|na|as|sa)\d*$/);
+        var meta = PROXY_META[proxy.id];
 
-        return match ? match[1] : null;
+        return meta ? meta.cdn : null;
+
+    }
+
+
+    // Infobulle posée sur la pastille de région, dans le menu comme
+    // dans le tableau du dashboard : un drapeau seul ne peut pas dire
+    // les deux faits à la fois.
+    function getProxyTipAttrs(proxy) {
+
+        var meta = PROXY_META[proxy.id];
+
+        if (!meta) {
+            return '';
+        }
+
+        var region = PROXY_REGION_META[meta.cdn];
+
+        return (
+            ' data-tp9-tip="' +
+            escapeHTML(
+                meta.host
+                    ? 'Hébergé en ' + meta.host
+                    : 'Hébergement réparti sur plusieurs pays'
+            ) +
+            '" data-tp9-tip-sub="' +
+            escapeHTML(
+                'Flux servi par le CDN Twitch ' +
+                (region ? region.label : '?') +
+                " — c'est lui qui donne la région."
+            ) +
+            '"'
+        );
 
     }
 
@@ -1622,6 +1686,10 @@
                 // bleu et gardé son drapeau.
                 accent: getProxyAccent(proxy),
                 icon: getProxyIcon(proxy),
+
+                // Pays d'hébergement + CDN Twitch, en infobulle sur
+                // la pastille (voir getProxyTipAttrs).
+                tip: getProxyTipAttrs(proxy),
 
                 score: computeProxyScore(successRate, avgLatency)
             };
@@ -4770,6 +4838,10 @@ document.addEventListener(
         { id: 'eu', label: 'Europe', icon: '🇪🇺', accent: '#4fc3f7' },
         { id: 'na', label: 'Amérique du Nord', icon: '🇺🇸', accent: '#ff9d4d' },
         { id: 'as', label: 'Asie', icon: '🌏', accent: '#00d084' },
+        // Plus aucun relais n'y tombe : lb-sa est à New York et sert
+        // du CDN NA. Le groupe reste déclaré pour le jour où un vrai
+        // relais sud-américain apparaîtrait — renderProxyList saute
+        // de toute façon les groupes vides.
         { id: 'sa', label: 'Amérique du Sud', icon: '🌎', accent: '#ff8fd6' },
         { id: 'custom', label: 'Perso', icon: '⚙️', accent: '#bf94ff' },
         { id: 'other', label: 'Autres', icon: '📡', accent: '#9147ff' },
@@ -5116,7 +5188,10 @@ document.addEventListener(
                             ${proxy.enabled ? 'checked' : ''}
                         >
 
-                        <div class="tp9-proxy-avatar">
+                        <div
+                            class="tp9-proxy-avatar"
+                            ${getProxyTipAttrs(proxy)}
+                        >
                             ${getProxyIcon(proxy)}
                         </div>
 
@@ -17119,7 +17194,8 @@ dashboardButton.style.visibility =
                 '<div class="tp9s-table-row tp9s-table-row-relais">' +
                     '<div class="tp9s-td tp9s-td-rank">' + sortRankHTML(index) + '</div>' +
                     '<div class="tp9s-td tp9s-td-name-flex">' +
-                        '<div class="tp9s-avatar" style="--accent:' + p.accent + '">' +
+                        '<div class="tp9s-avatar" style="--accent:' + p.accent + '"' +
+                            p.tip + '>' +
                             p.icon +
                         '</div>' +
                         '<span>' + escapeHTML(p.name) + '</span>' +
