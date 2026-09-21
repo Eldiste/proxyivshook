@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.7.2
+// @version      1.7.3
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.7.2';
+    var CURRENT_VERSION = '1.7.3';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -4745,7 +4745,7 @@
                     </div>
 
                     <div class="tp9-brand-text">
-                        <div class="tp9-title">Twitch HLS Proxy</div>
+                        <div class="tp9-title">Twitch HLS Proxy<span class="tp9-version">v${CURRENT_VERSION}</span></div>
                         <div class="tp9-subtitle">PROXY MANAGER</div>
                     </div>
 
@@ -4871,15 +4871,6 @@
             <span class="tp9-switch-track"></span>
         </span>
     </label>
-
-    <div class="tp9-dvr-depth">
-        <div class="tp9-dvr-depth-head">
-            <span class="tp9-dvr-depth-title">Profondeur gardée en mémoire</span>
-            <span class="tp9-dvr-depth-value">3 min</span>
-        </div>
-        <input type="range" class="tp9-dvr-range" min="0" max="8" step="1" value="3">
-        <div class="tp9-dvr-depth-hint"></div>
-    </div>
 
     <label class="tp9-select-field tp9-dvr-auto-field"
         data-tp9-tip="Lecteur perso par défaut"
@@ -5130,11 +5121,11 @@ document.addEventListener(
 
         // L'interrupteur « Retour arrière » vivait ici ET dans les
         // réglages du Player Custom, sur la même chaîne, avec le
-        // même effet. Un réglage PAR CHAÎNE n'a rien à faire dans un
-        // menu global : il est resté là où on s'en sert, dans la
-        // barre du lecteur (bouton ⚙). Ne restent ici que les deux
-        // réglages qui sont bien globaux — la profondeur gardée en
-        // mémoire, et l'ouverture automatique du lecteur.
+        // même effet. Il est resté là où on s'en sert, dans la
+        // barre du lecteur (bouton ⚙) — et la profondeur gardée en
+        // mémoire l'y a rejoint, pour la même raison : deux
+        // curseurs pour un seul réglage, c'est un de trop. Ne
+        // reste donc ici que l'ouverture automatique du lecteur.
         dashboard
             .querySelector('.tp9-dvr-auto')
             .addEventListener(
@@ -5152,50 +5143,6 @@ document.addEventListener(
                     // à l'ouverture automatique sans attendre un
                     // changement de chaîne.
                     dvrAutoOpenedFor = null;
-
-                }
-            );
-
-
-        // L'estimation suit le curseur pendant qu'on le tire,
-        // mais on n'enregistre qu'au relâchement : sinon on
-        // écrirait la config à chaque pixel parcouru.
-        dashboard
-            .querySelector('.tp9-dvr-range')
-            .addEventListener(
-                'input',
-                function (event) {
-
-                    updateDvrDepthLabels(
-                        DVR_BUFFER_STEPS[
-                            parseInt(event.target.value, 10)
-                        ] ||
-                        DEFAULT_DVR_BUFFER_SECONDS
-                    );
-
-                }
-            );
-
-
-        dashboard
-            .querySelector('.tp9-dvr-range')
-            .addEventListener(
-                'change',
-                function (event) {
-
-                    pageConfig.dvrBufferSeconds =
-                        DVR_BUFFER_STEPS[
-                            parseInt(event.target.value, 10)
-                        ] ||
-                        DEFAULT_DVR_BUFFER_SECONDS;
-
-                    saveConfig(pageConfig);
-
-                    broadcastConfig();
-
-                    updateDvrDepthLabels(
-                        pageConfig.dvrBufferSeconds
-                    );
 
                 }
             );
@@ -6290,37 +6237,6 @@ document.addEventListener(
         updateBackupUI();
 
 
-        var dvrRange =
-            dashboard.querySelector('.tp9-dvr-range');
-
-        if (dvrRange) {
-
-            var dvrIndex =
-                DVR_BUFFER_STEPS.indexOf(
-                    pageConfig.dvrBufferSeconds
-                );
-
-            if (dvrIndex < 0) {
-
-                dvrIndex =
-                    DVR_BUFFER_STEPS.indexOf(
-                        DEFAULT_DVR_BUFFER_SECONDS
-                    );
-
-            }
-
-            dvrRange.max =
-                String(DVR_BUFFER_STEPS.length - 1);
-
-            dvrRange.value = String(dvrIndex);
-
-        }
-
-        // Plus grisé : c'est un réglage GLOBAL, et le menu n'a plus
-        // l'interrupteur qui permettrait de le dégriser. Il se lit
-        // et se règle quand on veut ; il s'appliquera aux chaînes
-        // armées depuis le lecteur.
-
         var dvrAuto =
             dashboard.querySelector('.tp9-dvr-auto');
 
@@ -6330,12 +6246,6 @@ document.addEventListener(
                 pageConfig.dvrAutoOpen || 'never';
 
         }
-
-        updateDvrDepthLabels(
-            pageConfig.dvrBufferSeconds ||
-            DEFAULT_DVR_BUFFER_SECONDS
-        );
-
 
         dashboard
             .querySelector(
@@ -7749,133 +7659,13 @@ function showAddProxyForm() {
         }
 
 
-        /* =====================================================
-           RÉGLAGES : PROFONDEUR DU BUFFER
-        ===================================================== */
-
-        .tp9-dvr-depth {
-
-            margin-top: 8px;
-
-            padding: 10px 12px;
-
-            border-radius: 8px;
-
-            background: rgba(255,255,255,.04);
-
-        }
-
-        .tp9-dvr-depth-head {
-
-            display: flex;
-
-            align-items: baseline;
-
-            justify-content: space-between;
-
-            gap: 8px;
-
-            margin-bottom: 8px;
-
-        }
-
-        .tp9-dvr-depth-title {
-
-            color: rgba(255,255,255,.72);
-
-            font-size: 11px;
-
-        }
-
-        .tp9-dvr-depth-value {
-
-            color: #fff;
-
-            font-size: 12px;
-
-            font-weight: 700;
-
-            font-variant-numeric: tabular-nums;
-
-        }
-
-        .tp9-dvr-range {
-
-            -webkit-appearance: none;
-
-            appearance: none;
-
-            width: 100%;
-
-            height: 4px;
-
-            border-radius: 2px;
-
-            background: rgba(255,255,255,.18);
-
-            cursor: pointer;
-
-        }
-
-        .tp9-dvr-range::-webkit-slider-thumb {
-
-            -webkit-appearance: none;
-
-            appearance: none;
-
-            width: 13px;
-
-            height: 13px;
-
-            border: none;
-
-            border-radius: 50%;
-
-            background: #9147ff;
-
-        }
-
-        .tp9-dvr-range::-moz-range-thumb {
-
-            width: 13px;
-
-            height: 13px;
-
-            border: none;
-
-            border-radius: 50%;
-
-            background: #9147ff;
-
-        }
-
-        .tp9-dvr-depth-hint {
-
-            margin-top: 7px;
-
-            color: rgba(255,255,255,.45);
-
-            font-size: 10px;
-
-        }
-
-        /* Sans chaîne armée, le curseur ne pilote rien : il doit le
-           montrer plutôt que de laisser croire à un réglage actif. */
-
-        /* Le réglage d'ouverture automatique ne dépend pas de
-           l'armement du buffer : il vit donc HORS du bloc de
-           profondeur, qui se grise quand la chaîne n'est pas
-           armée. */
+        /* Le seul réglage de retour arrière qui reste ici : la
+           profondeur gardée en mémoire se règle maintenant dans
+           les réglages du lecteur perso, là où on s'en sert. */
 
         .tp9-dvr-auto-field {
 
             margin-top: 10px;
-
-        }
-
-        .tp9-dvr-depth.tp9-dvr-depth-idle {
-
-            opacity: .5;
 
         }
 
@@ -7962,13 +7752,6 @@ function showAddProxyForm() {
             background: rgba(235,4,0,.26);
 
             color: #ff9b98;
-
-        }
-
-
-        .tp9dvr-close:hover {
-
-            background: rgba(235,4,0,.55);
 
         }
 
@@ -13025,10 +12808,6 @@ function showAddProxyForm() {
             ' data-tp9-tip="Revenir au direct"' +
             ' data-tp9-tip-sub="Sans fermer la barre : tu peux repartir en arrière juste après.">' +
             '<span class="tp9dvr-live-dot"></span>DIRECT</button>' +
-            '<button class="tp9dvr-btn tp9dvr-close" type="button"' +
-            ' data-tp9-tip="Fermer la barre"' +
-            ' data-tp9-tip-sub="Rend la main au lecteur Twitch et à son son.">' +
-            DVR_ICONS.close + '</button>' +
             '</div>' +
             '</div>';
 
@@ -13283,6 +13062,173 @@ function showAddProxyForm() {
         var name = dvrLevelName(levels[index]);
 
         return name ? 'Auto · ' + name : 'Auto';
+
+    }
+
+
+    // Sur le direct, l'image vient du lecteur de Twitch : ni
+    // hls.js ni nos niveaux ne savent ce qui est joué, et le
+    // bouton se contentait du mot « Qualité ». Sa <video>, elle,
+    // le sait — sa hauteur EST le rendu courant. La cadence, que
+    // rien n'expose, se déduit du compteur d'images décodées
+    // relevé d'un tick à l'autre.
+    var dvrTwitchFpsVideo = null;
+    var dvrTwitchFpsFrames = -1;
+    var dvrTwitchFpsAt = 0;
+    var dvrTwitchFps = 0;
+
+
+    function dvrSampleTwitchFps(video) {
+
+        if (
+            !video ||
+            typeof video.getVideoPlaybackQuality !== 'function'
+        ) {
+
+            dvrTwitchFpsVideo = null;
+
+            dvrTwitchFps = 0;
+
+            return;
+
+        }
+
+        // Lecteur remplacé (pub, changement de qualité) : le
+        // compteur repart de zéro, et la cadence d'avant ne dit
+        // plus rien de celle d'après.
+        if (video !== dvrTwitchFpsVideo) {
+
+            dvrTwitchFpsVideo = video;
+
+            dvrTwitchFpsFrames = -1;
+
+            dvrTwitchFps = 0;
+
+        }
+
+        if (video.paused) {
+            return;
+        }
+
+        var frames;
+
+        try {
+
+            frames =
+                video.getVideoPlaybackQuality()
+                    .totalVideoFrames || 0;
+
+        } catch (e) {
+            return;
+        }
+
+        var now = Date.now();
+
+        // Premier relevé, ou compteur reparti en arrière : on ne
+        // fait que poser le repère.
+        if (dvrTwitchFpsFrames < 0 || frames < dvrTwitchFpsFrames) {
+
+            dvrTwitchFpsFrames = frames;
+
+            dvrTwitchFpsAt = now;
+
+            return;
+
+        }
+
+        var elapsed = now - dvrTwitchFpsAt;
+
+        // Une seconde de recul au moins : sur les 250 ms du tick,
+        // une image de plus ou de moins déplace la mesure de 4.
+        if (elapsed < 1000) {
+            return;
+        }
+
+        dvrTwitchFps =
+            (frames - dvrTwitchFpsFrames) * 1000 / elapsed;
+
+        dvrTwitchFpsFrames = frames;
+
+        dvrTwitchFpsAt = now;
+
+    }
+
+
+    function dvrTwitchQualityLabel() {
+
+        var video = dvrLiveVideo;
+
+        // La barre peut s'ouvrir avant qu'on ait repéré le
+        // lecteur de Twitch, et il se fait remplacer en cours de
+        // route.
+        if (!video || video.isConnected === false) {
+
+            dvrFindLivePlayer();
+
+            video = dvrLiveVideo;
+
+        }
+
+        dvrSampleTwitchFps(video);
+
+        if (!video || !video.videoHeight) {
+            return '';
+        }
+
+        // Même écriture que dvrLevelName : « 1080p60 », pas
+        // « 1080p 59,94 im/s ».
+        return (
+            video.videoHeight + 'p' +
+            (dvrTwitchFps > 35 ? '60' : '')
+        );
+
+    }
+
+
+    // Tant que la hauteur n'est pas connue (lecteur pas encore
+    // démarré, pub en cours), le mot seul reste préférable à un
+    // bouton vide.
+    function dvrLiveQualityLabel() {
+
+        return dvrTwitchQualityLabel() || 'Qualité';
+
+    }
+
+
+    // Ce que le bouton affiche en ce moment : Twitch change de
+    // rendu tout seul en Auto, et dvrRefreshControls ne tourne
+    // pas à chaque changement. Le tick relit donc le libellé,
+    // mais n'écrit que s'il a bougé — toucher textContent à
+    // 4 Hz relancerait une mise en page pour rien.
+    var dvrTwitchQualityShown = '';
+
+
+    function dvrSyncTwitchQualityLabel() {
+
+        if (!dvrOverlay || !dvrIsLive()) {
+
+            dvrTwitchQualityShown = '';
+
+            return;
+
+        }
+
+        var button =
+            dvrOverlay.querySelector('.tp9dvr-quality');
+
+        if (!button) {
+            return;
+        }
+
+        var label = dvrLiveQualityLabel();
+
+        if (label === dvrTwitchQualityShown) {
+            return;
+        }
+
+        dvrTwitchQualityShown = label;
+
+        button.textContent = label;
 
     }
 
@@ -14290,17 +14236,6 @@ function showAddProxyForm() {
             );
 
 
-        dvrOverlay
-            .querySelector('.tp9dvr-close')
-            .addEventListener(
-                'click',
-                function () {
-
-                    closeDvr();
-
-                }
-            );
-
 
         // AVANT que Twitch ne referme son propre menu : voir
         // dvrOpenTwitchQuality.
@@ -14909,12 +14844,18 @@ function showAddProxyForm() {
                 : levels.length < 2;
 
             quality.textContent = live
-                ? 'Qualité'
+                ? dvrLiveQualityLabel()
                 : dvrQualityLabel();
+
+            // Le tick compare à CE qu'on vient d'écrire : sans
+            // ça il croirait le libellé déjà à jour.
+            dvrTwitchQualityShown = live
+                ? quality.textContent
+                : '';
 
             quality.dataset.tp9TipSub = live
                 ? (twitchQuality
-                    ? 'Le direct est joué par le lecteur Twitch : ce bouton ouvre SON réglage de qualité.'
+                    ? 'Rendu joué par le lecteur Twitch : ce bouton ouvre SON réglage de qualité.'
                     : 'Twitch n\'expose pas ses réglages ici.')
                 : (levels.length < 2
                     ? "Cette source n'a qu'un seul rendu : la mémoire rejoue exactement ce que le lecteur téléchargeait."
@@ -14971,6 +14912,8 @@ function showAddProxyForm() {
         dvrTickSettingsMenu();
 
         dvrUpdateBufferMeta();
+
+        dvrSyncTwitchQualityLabel();
 
         var pauseKind = dvrIsLive() ? dvrLivePauseKind() : null;
 
@@ -15477,9 +15420,9 @@ function showAddProxyForm() {
 
         dvrButton.style.visibility = 'hidden';
 
-        // Il ouvre ET il ferme : la croix de la barre n'était pas le
-        // seul moyen de rendre la main au lecteur Twitch, encore
-        // fallait-il que ce bouton-là le fasse aussi.
+        // Il ouvre ET il ferme : c'est maintenant le seul moyen
+        // de rendre la main au lecteur Twitch. La croix de la
+        // barre faisait doublon avec lui, elle a été retirée.
         dvrButton.addEventListener(
             'click',
             function () {
@@ -15956,67 +15899,6 @@ function showAddProxyForm() {
             DVR_FALLBACK_BYTES_PER_SECOND;
 
         return seconds * bps;
-
-    }
-
-
-    // L'estimation bouge pendant qu'on déplace le curseur : c'est
-    // tout l'intérêt d'un curseur plutôt que d'une liste déroulante,
-    // 30 min ne veut rien dire tant qu'on n'a pas vu « 1,4 Go ».
-    function updateDvrDepthLabels(seconds) {
-
-        if (!dashboard) {
-            return;
-        }
-
-        var value =
-            dashboard.querySelector('.tp9-dvr-depth-value');
-
-        if (value) {
-
-            value.textContent =
-                dvrBufferLabel(seconds);
-
-        }
-
-        var hint =
-            dashboard.querySelector('.tp9-dvr-depth-hint');
-
-        if (hint) {
-
-            // Tant que rien n'est enregistré, on annonce ce que ça
-            // VA coûter. Dès qu'il y a de la mémoire, on annonce ce
-            // que ça coûte — le Worker compte les octets qu'il
-            // retient vraiment, et c'est la seule réponse honnête à
-            // « est-ce que ça bouffe de la RAM ».
-            if (dvrSegmentsBytes > 0) {
-
-                hint.textContent =
-                    formatBytes(dvrSegmentsBytes) +
-                    ' en mémoire pour l\'instant (' +
-                    dvrBufferLabel(
-                        Math.round(dvrSegmentsSpan)
-                    ) +
-                    ') · plafond ≈ ' +
-                    formatBytes(dvrEstimateBytes(seconds));
-
-            } else {
-
-                hint.textContent =
-                    '≈ ' +
-                    formatBytes(
-                        dvrEstimateBytes(seconds)
-                    ) +
-                    ' en mémoire · ' +
-                    (
-                        getLiveThroughputBps()
-                            ? 'd\'après ton débit mesuré'
-                            : 'estimation, aucun débit mesuré pour l\'instant'
-                    );
-
-            }
-
-        }
 
     }
 
@@ -16977,6 +16859,33 @@ dashboardButton.style.visibility =
                 font-size: 14px;
 
                 font-weight: 800;
+
+            }
+
+            /* La version se lit d'un coup d'œil, sans ouvrir
+               Tampermonkey : c'est la première chose qu'on
+               demande à quelqu'un qui signale un bug. */
+            .tp9-version {
+
+                display: inline-block;
+
+                margin-left: 6px;
+
+                padding: 1px 5px;
+
+                border-radius: 4px;
+
+                background: rgba(145,71,255,.18);
+
+                color: #bf94ff;
+
+                font-size: 9px;
+
+                font-weight: 700;
+
+                letter-spacing: .4px;
+
+                vertical-align: middle;
 
             }
 
@@ -20379,6 +20288,33 @@ dashboardButton.style.visibility =
                 font-weight: 800;
 
                 letter-spacing: .5px;
+
+            }
+
+            /* La version se lit d'un coup d'œil, sans ouvrir
+               Tampermonkey : c'est la première chose qu'on
+               demande à quelqu'un qui signale un bug. */
+            .tp9s-brand-version {
+
+                display: inline-block;
+
+                margin-left: 6px;
+
+                padding: 1px 5px;
+
+                border-radius: 4px;
+
+                background: rgba(145,71,255,.18);
+
+                color: #bf94ff;
+
+                font-size: 9px;
+
+                font-weight: 700;
+
+                letter-spacing: .4px;
+
+                vertical-align: middle;
 
             }
 
@@ -24513,7 +24449,7 @@ dashboardButton.style.visibility =
                 <div class="tp9s-brand">
                     <div class="tp9s-brand-icon">P</div>
                     <div>
-                        <div class="tp9s-brand-title">DASHBOARD</div>
+                        <div class="tp9s-brand-title">DASHBOARD<span class="tp9s-brand-version">v${CURRENT_VERSION}</span></div>
                         <div class="tp9s-brand-sub">TWITCH HLS PROXY</div>
                     </div>
                 </div>
