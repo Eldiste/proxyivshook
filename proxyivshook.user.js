@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.7.0
+// @version      1.7.1
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.7.0';
+    var CURRENT_VERSION = '1.7.1';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -12293,8 +12293,8 @@ function showAddProxyForm() {
             '<div class="tp9dvr-menu tp9dvr-settings-menu"></div>' +
             '<div class="tp9dvr-bar">' +
             '<div class="tp9dvr-meta"' +
-            ' data-tp9-tip="Où en est la mémoire"' +
-            ' data-tp9-tip-sub="Ce qui est déjà rejouable sur cette chaîne, et ce que ça occupe en RAM. Se met à jour tout seul."></div>' +
+            ' data-tp9-tip=""' +
+            ' data-tp9-tip-sub=""></div>' +
             '<div class="tp9dvr-row">' +
             '<button class="tp9dvr-btn tp9dvr-play" type="button"' +
             ' data-tp9-tip="Pause">' + DVR_ICONS.pause + '</button>' +
