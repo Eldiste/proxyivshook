@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.7.3
+// @version      1.7.4
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.7.3';
+    var CURRENT_VERSION = '1.7.4';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -2827,7 +2827,12 @@
 
     // Point d'entrée unique des trois sources : c'est le seul
     // endroit qui écrit les octets dans les stats.
-    function recordBandwidthBytes(channel, bytes, source) {
+    //
+    // `options.viaProxy === false` : octets qui ne sont pas passés
+    // par la course des relais (le VOD que le Player Custom lit
+    // lui-même). Ils comptent dans les totaux, mais pas au crédit
+    // du proxy actif, qui n'y est pour rien.
+    function recordBandwidthBytes(channel, bytes, source, options) {
 
         if (!channel || !bytes || bytes <= 0) {
             return;
@@ -2847,6 +2852,7 @@
         }
 
         if (
+            !(options && options.viaProxy === false) &&
             activeProxyInfo &&
             !activeProxyInfo.direct &&
             activeProxyInfo.channel === channel &&
@@ -2925,35 +2931,53 @@
     // visionnage. Les sauts (retour arrière dans le DVR, saut au
     // direct) sont ignorés ou plafonnés.
 
-    var watchTimeSample = { channel: null, currentTime: null, at: 0 };
+    function emptyTimeSample() {
+
+        return {
+            channel: null,
+            video: null,
+            currentTime: null,
+            at: 0
+        };
+
+    }
+
+    // Ce qu'on REGARDE. Le Player Custom ouvert dans le passé,
+    // c'est sa vidéo à lui qui est à l'écran — pas celle de
+    // Twitch, qui continue en muet derrière pour remplir la
+    // mémoire.
+    var watchTimeSample = emptyTimeSample();
+
+    // Le même relevé, tenu à part, sur la vidéo de TWITCH : c'est
+    // elle qui télécharge. Sans ce second repère, la bande
+    // passante estimée se calait sur le temps de visionnage, et
+    // une pause dans le passé cessait de compter des octets qui
+    // arrivaient pourtant.
+    var bandwidthTimeSample = emptyTimeSample();
 
     // Marge tolérée au-dessus du temps réellement écoulé entre deux
     // ticks, pour absorber les petites imprécisions de mesure.
     var WATCH_DELTA_MAX_RATIO = 1.5;
 
-    function readWatchedMs(video, channel) {
+    // Le cœur des deux relevés : combien de temps de flux a défilé
+    // entre les deux photos, plafonné par l'horloge réelle.
+    function sampleAdvance(previous, sample) {
 
-        var now = Date.now();
-
-        var currentTime = video.currentTime;
-
-        var previous = watchTimeSample;
-
-        watchTimeSample = {
-            channel: channel,
-            currentTime: currentTime,
-            at: now
-        };
-
+        // Autre élément <video> que la fois précédente (Player
+        // Custom qui passe du direct au passé, lecteur Twitch
+        // remplacé par une pub) : deux horloges sans rapport,
+        // leur écart ne mesure rien.
         if (
-            previous.channel !== channel ||
+            previous.channel !== sample.channel ||
+            previous.video !== sample.video ||
             typeof previous.currentTime !== 'number' ||
-            typeof currentTime !== 'number'
+            typeof sample.currentTime !== 'number'
         ) {
             return 0;
         }
 
-        var deltaMs = (currentTime - previous.currentTime) * 1000;
+        var deltaMs =
+            (sample.currentTime - previous.currentTime) * 1000;
 
         // Retour arrière (seek) : rien à compter pour ce tick.
         if (deltaMs <= 0) {
@@ -2968,13 +2992,46 @@
         // le visionnage alors que la lecture, elle, avait bien
         // avancé pendant tout l'intervalle.
         var elapsedMs = previous.at
-            ? (now - previous.at)
+            ? (sample.at - previous.at)
             : BANDWIDTH_TICK_MS;
 
         return Math.min(
             deltaMs,
             Math.max(elapsedMs, BANDWIDTH_TICK_MS) * WATCH_DELTA_MAX_RATIO
         );
+
+    }
+
+    function readWatchedMs(video, channel) {
+
+        var previous = watchTimeSample;
+
+        watchTimeSample = {
+            channel: channel,
+            video: video,
+            currentTime: video.currentTime,
+            at: Date.now()
+        };
+
+        return sampleAdvance(previous, watchTimeSample);
+
+    }
+
+    // Ce que la vidéo de Twitch a téléchargé, elle, depuis le tick
+    // précédent : la source « estimate » s'en sert pour convertir
+    // du temps de flux en octets.
+    function readDownloadedMs(video, channel) {
+
+        var previous = bandwidthTimeSample;
+
+        bandwidthTimeSample = {
+            channel: channel,
+            video: video,
+            currentTime: video.currentTime,
+            at: Date.now()
+        };
+
+        return sampleAdvance(previous, bandwidthTimeSample);
 
     }
 
@@ -3231,6 +3288,28 @@
     }
 
 
+    // La vidéo qu'on REGARDE, qui n'est pas toujours celle qui
+    // joue le direct. Player Custom ouvert dans le passé (mémoire
+    // ou VOD) : c'est la sienne qui est à l'écran, et celle de
+    // Twitch continue en muet derrière pour remplir la mémoire. Le
+    // temps de visionnage se lisait sur celle de Twitch : une
+    // pause faite dans le passé continuait donc de compter comme
+    // du visionnage.
+    //
+    // getActivePlayback, lui, reste calé sur le lecteur Twitch :
+    // c'est lui qui télécharge, et la bande passante doit suivre
+    // les octets réellement reçus, pause dans le passé comprise.
+    function getShownVideo(liveVideo) {
+
+        if (dvrOverlay && dvrVideo && !dvrIsLive()) {
+            return dvrVideo;
+        }
+
+        return liveVideo;
+
+    }
+
+
     function trackBandwidthAndWatchTime() {
 
         var playback = getActivePlayback();
@@ -3238,10 +3317,11 @@
         if (!playback) {
 
             // Lecture interrompue, ou vidéo qui ne doit pas compter
-            // (aperçu automatique, bande-annonce) : on oublie le
-            // repère, sinon la reprise compterait tout le temps
+            // (aperçu automatique, bande-annonce) : on oublie les
+            // repères, sinon la reprise compterait tout le temps
             // écoulé entre les deux.
-            watchTimeSample = { channel: null, currentTime: null, at: 0 };
+            watchTimeSample = emptyTimeSample();
+            bandwidthTimeSample = emptyTimeSample();
 
             return;
 
@@ -3250,7 +3330,31 @@
         var channel = playback.channel;
         var video = playback.video;
 
-        var watchedMs = readWatchedMs(video, channel);
+        // Le temps de visionnage se lit sur la vidéo À L'ÉCRAN, les
+        // octets sur celle de Twitch : voir getShownVideo.
+        var shownVideo = getShownVideo(video);
+
+        var watchedMs = 0;
+
+        if (
+            shownVideo === video ||
+            (
+                !shownVideo.paused &&
+                !shownVideo.ended &&
+                shownVideo.readyState >= 2
+            )
+        ) {
+
+            watchedMs = readWatchedMs(shownVideo, channel);
+
+        } else {
+
+            // Passé mis en pause, ou source encore en chargement :
+            // rien à compter, et un repère périmé ferait compter un
+            // saut à la reprise.
+            watchTimeSample = emptyTimeSample();
+
+        }
 
         // ---- bande passante ----
 
@@ -3266,15 +3370,25 @@
 
                 recordBandwidthBytes(channel, decoderDelta, 'decoder');
 
-            } else if (watchedMs > 0) {
+            } else {
 
-                var kbps = estimateKbpsForHeight(video.videoHeight || 0);
+                // Sur la vidéo de TWITCH, et non sur le temps de
+                // visionnage : elle télécharge même quand le passé
+                // est en pause, et ces octets-là sont bien reçus.
+                var downloadedMs = readDownloadedMs(video, channel);
 
-                recordBandwidthBytes(
-                    channel,
-                    (kbps * 1000 / 8) * (watchedMs / 1000),
-                    'estimate'
-                );
+                if (downloadedMs > 0) {
+
+                    var kbps =
+                        estimateKbpsForHeight(video.videoHeight || 0);
+
+                    recordBandwidthBytes(
+                        channel,
+                        (kbps * 1000 / 8) * (downloadedMs / 1000),
+                        'estimate'
+                    );
+
+                }
 
             }
 
@@ -12087,6 +12201,42 @@ function showAddProxyForm() {
 
         dvrHls = new lib(options);
 
+        // Le VOD se télécharge ICI, par hls.js, hors du Worker qui
+        // compte les octets : regarder le passé depuis le VOD ne
+        // coûtait donc rien au compteur. La mémoire, elle, rejoue
+        // des segments déjà comptés quand le lecteur Twitch les a
+        // reçus : on ne la recompte pas.
+        //
+        // Aucune source n'est passée : elle décrit la MÉTHODE de
+        // mesure du direct, affichée sous le total du dashboard, et
+        // un VOD n'a pas à la réécrire.
+        if (kind === 'vod') {
+
+            dvrHls.on(
+                lib.Events.FRAG_LOADED,
+                function (event, data) {
+
+                    var bytes =
+                        data &&
+                        data.payload &&
+                        data.payload.byteLength;
+
+                    if (bytes > 0 && dvrChannelInUse) {
+
+                        recordBandwidthBytes(
+                            dvrChannelInUse,
+                            bytes,
+                            null,
+                            { viaProxy: false }
+                        );
+
+                    }
+
+                }
+            );
+
+        }
+
         dvrHls.on(
             lib.Events.LEVEL_SWITCHED,
             function () {
@@ -13315,7 +13465,6 @@ function showAddProxyForm() {
 
         var host = dvrOverlay.getBoundingClientRect();
         var rect = button.getBoundingClientRect();
-        var barRect = bar.getBoundingClientRect();
 
         if (!host.width || !rect.width) {
             return;
@@ -13323,10 +13472,12 @@ function showAddProxyForm() {
 
         menu.style.right = 'auto';
 
-        // Juste au-dessus de la barre, quelle que soit sa hauteur
-        // (elle change avec la taille du lecteur).
+        // Juste au-dessus du BOUTON, et non de la barre : celle-ci
+        // commence bien plus haut que ses commandes (26 px de
+        // dégradé transparent, puis la ligne d'info), et le menu se
+        // retrouvait à flotter loin au-dessus de la roue dentée.
         menu.style.bottom =
-            Math.max(8, host.bottom - barRect.top + 6) + 'px';
+            Math.max(8, host.bottom - rect.top + 6) + 'px';
 
         var width = menu.offsetWidth;
 
