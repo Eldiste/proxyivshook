@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.7.4
+// @version      1.7.5
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.7.4';
+    var CURRENT_VERSION = '1.7.5';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -14657,7 +14657,11 @@ function showAddProxyForm() {
             'mousemove',
             function (event) {
 
+                // Le temps survolé d'abord : dvrKeepSeekTooltip lit
+                // l'attribut que celui-ci vient d'écrire.
                 dvrTrackHover(seekWrap, event.clientX);
+
+                dvrKeepSeekTooltip(seekWrap);
 
             }
         );
@@ -15369,6 +15373,31 @@ function showAddProxyForm() {
     // barre : « Position dans le passé » tout court ne disait pas où
     // l'on pointait, et il fallait cliquer pour le savoir.
     var dvrHoverOffset = null;
+
+
+    // Un clic ferme la bulle partagée, où qu'il ait lieu (voir le
+    // dernier écouteur d'attachTooltips), et rien ne la rouvre tant
+    // que la souris n'ENTRE pas à nouveau sur un élément — un
+    // mouseover ne part qu'au franchissement de la bordure.
+    //
+    // Sur la timeline, c'est intenable : on y clique précisément
+    // sans bouger de place, et le temps survolé disparaissait donc
+    // au premier déplacement demandé, pour ne revenir qu'après être
+    // sorti du curseur puis revenu dessus.
+    //
+    // On la rallume au premier mouvement, ce qu'on fait de toute
+    // façon en manipulant une barre de position. Réservé à la
+    // timeline : sur un bouton, la bulle qui se rouvre juste après
+    // le clic n'aurait rien à apprendre à personne.
+    function dvrKeepSeekTooltip(wrap) {
+
+        if (tooltipTarget === wrap) {
+            return;
+        }
+
+        showTooltipFor(wrap);
+
+    }
 
     function dvrTimelineTitle() {
 
