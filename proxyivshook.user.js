@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.7.1
+// @version      1.7.2
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.7.1';
+    var CURRENT_VERSION = '1.7.2';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -351,6 +351,39 @@
     }
 
 
+    // Une URL de relais valide : http(s), et {channel} dedans. Le
+    // formulaire d'ajout le vérifiait, l'import non — n'importe quel
+    // javascript:... ou data:... passait.
+    function isProxyURLValid(url) {
+
+        if (
+            typeof url !== 'string' ||
+            url.indexOf('{channel}') === -1
+        ) {
+            return false;
+        }
+
+        try {
+
+            // {channel} est remplacé le temps du contrôle seulement :
+            // le proxy enregistré le conserve.
+            var parsed = new URL(
+                url.replace('{channel}', 'testchannel')
+            );
+
+            return (
+                parsed.protocol === 'http:' ||
+                parsed.protocol === 'https:'
+            );
+
+        } catch (e) {
+
+            return false;
+
+        }
+
+    }
+
     function buildConfigFromParsed(parsed) {
 
         var config = {
@@ -441,10 +474,7 @@
 
                     if (
                         savedProxy.name &&
-                        savedProxy.url &&
-                        savedProxy.url.indexOf(
-                            '{channel}'
-                        ) >= 0
+                        isProxyURLValid(savedProxy.url)
                     ) {
 
                         ordered.push({
@@ -1077,6 +1107,12 @@
             // afficher la provenance de la mesure.
             bandwidthSource: null,
 
+            // Incrémenté à chaque remise à zéro et à chaque import :
+            // voir mergeStatsWithStored. Il permet aux autres onglets
+            // de JETER leurs incréments en attente au lieu de
+            // ressusciter des chiffres qu'on vient d'effacer.
+            epoch: 0,
+
             totals: {
                 chatMessagesGlobal: 0,
                 bandwidthBytesGlobal: 0,
@@ -1119,6 +1155,7 @@
                             : [];
                     stats.proxyLiveLatency = parsed.proxyLiveLatency || {};
                     stats.bandwidthSource = parsed.bandwidthSource || null;
+                    stats.epoch = parsed.epoch || 0;
 
                     stats.totals = Object.assign(
                         defaultStats().totals,
@@ -1141,7 +1178,348 @@
 
     }
 
+    // ------------------------------------------------------------
+    // ÉCRITURE PARTAGÉE ENTRE ONGLETS
+    // ------------------------------------------------------------
+    //
+    // Chaque onglet accumule ses incréments en mémoire et ne les
+    // écrit que 2 s plus tard (scheduleStatsSave). L'écouteur
+    // 'storage' remplaçait purement et simplement pageStats par la
+    // version d'un autre onglet : tout ce qui n'était pas encore
+    // écrit disparaissait, et la sauvegarde suivante réécrivait la
+    // version du voisin par-dessus. À deux onglets qui lisent
+    // chacun un live, avec un tick de 5 s et un flush à 2 s, c'est
+    // une bonne part du temps de visionnage qui n'arrivait jamais
+    // dans le total.
+    //
+    // On garde donc une PHOTO de ce que CET onglet a écrit en
+    // dernier (statsBaseline). C'est la chaîne déjà sérialisée par
+    // saveStatsNow : elle ne coûte rien de plus. Fusionner devient
+    // alors une opération à trois :
+    //
+    //     résultat = ce qu'il y a dans le stockage
+    //              + ( pageStats - statsBaseline )
+    //
+    // c'est-à-dire « la version des autres, plus ce que j'ai fait
+    // depuis ma dernière écriture ». Aucun site d'incrément n'a
+    // besoin d'être touché : le delta se calcule sur l'objet.
+
+    var statsBaseline = null;
+
+    // Les tableaux ne se concatènent JAMAIS : on les fusionne par
+    // identité, exactement comme mergeStatsFrom le fait pour un
+    // import. Les plafonds sont lus au moment de la fusion (par une
+    // fonction, donc) : plusieurs sont déclarés plus bas dans le
+    // fichier.
+    var STATS_ARRAY_RULES = {
+
+        logs: {
+            key: function (e) { return e.t + '|' + e.msg; },
+            time: function (e) { return e.t; },
+            order: 'desc',
+            max: function () { return STATS_MAX_LOGS; }
+        },
+
+        messages: {
+            key: function (e) { return e.t + '|' + e.text; },
+            time: function (e) { return e.t; },
+            order: 'asc',
+            max: function () { return CHAT_HISTORY_MAX_PER_STREAMER; }
+        },
+
+        sessions: {
+            key: function (e) { return String(e.start); },
+            time: function (e) { return e.start; },
+            order: 'asc',
+            max: function () { return SESSIONS_MAX; },
+
+            // Une session est PROLONGÉE en place (last.end, last.ms) :
+            // deux onglets qui regardent en même temps touchent donc
+            // la même entrée. On garde la plus longue plutôt que
+            // d'additionner deux durées qui se recouvrent.
+            pick: function (a, b) {
+                return (b.end || 0) > (a.end || 0) ? b : a;
+            }
+        },
+
+        directPlaybacks: {
+            key: function (e) { return e.t + '|' + e.channel; },
+            time: function (e) { return e.t; },
+            order: 'asc',
+            max: function () { return DIRECT_PLAYBACKS_MAX; }
+        },
+
+        proxyHistory: {
+            key: function (e) { return String(e.t); },
+            time: function (e) { return e.t; },
+            order: 'asc'
+        },
+
+        proxyLiveLatency: {
+            key: function (e) { return String(e.t); },
+            time: function (e) { return e.t; },
+            order: 'asc'
+        }
+
+    };
+
+    // Ces nombres-là sont des INSTANTS, pas des compteurs : leur
+    // appliquer un delta n'aurait aucun sens.
+    var STATS_INSTANT_FIELDS = {
+        firstSeen: 'min',
+        lastSeen: 'max'
+    };
+
+    function isPlainStatsObject(value) {
+
+        return !!value &&
+            typeof value === 'object' &&
+            !Array.isArray(value);
+
+    }
+
+    function mergeStatsArray(theirs, mine, base, rule) {
+
+        // Tableau sans règle connue : on ne sait pas dédupliquer,
+        // le stockage fait foi.
+        if (!rule) {
+            return theirs;
+        }
+
+        var kept = {};
+        var order = [];
+
+        function put(entry) {
+
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+
+            var k = rule.key(entry);
+
+            if (Object.prototype.hasOwnProperty.call(kept, k)) {
+
+                if (rule.pick) {
+                    kept[k] = rule.pick(kept[k], entry);
+                }
+
+                return;
+
+            }
+
+            kept[k] = entry;
+            order.push(k);
+
+        }
+
+        theirs.forEach(put);
+
+        var inBase = {};
+
+        (base || []).forEach(function (entry) {
+
+            if (entry && typeof entry === 'object') {
+                inBase[rule.key(entry)] = true;
+            }
+
+        });
+
+        mine.forEach(function (entry) {
+
+            if (!entry || typeof entry !== 'object') {
+                return;
+            }
+
+            var k = rule.key(entry);
+
+            // Déjà dans la photo mais absente du stockage : un autre
+            // onglet l'a fait expirer (plafond, purge 7 jours). On ne
+            // la ressuscite pas.
+            if (
+                Object.prototype.hasOwnProperty.call(inBase, k) &&
+                !Object.prototype.hasOwnProperty.call(kept, k)
+            ) {
+                return;
+            }
+
+            put(entry);
+
+        });
+
+        var merged = order.map(function (k) {
+            return kept[k];
+        });
+
+        if (rule.time) {
+
+            merged.sort(function (a, b) {
+
+                var d = (rule.time(a) || 0) - (rule.time(b) || 0);
+
+                return rule.order === 'desc' ? -d : d;
+
+            });
+
+        }
+
+        var cap = rule.max ? rule.max() : 0;
+
+        if (cap && merged.length > cap) {
+
+            merged = rule.order === 'desc'
+                ? merged.slice(0, cap)
+                : merged.slice(merged.length - cap);
+
+        }
+
+        return merged;
+
+    }
+
+    function mergeStatsValue(theirs, mine, base, fieldName, rule) {
+
+        if (Array.isArray(mine)) {
+
+            return mergeStatsArray(
+                Array.isArray(theirs) ? theirs : [],
+                mine,
+                Array.isArray(base) ? base : [],
+                rule
+            );
+
+        }
+
+        if (isPlainStatsObject(mine)) {
+
+            var out = {};
+
+            var theirObj = isPlainStatsObject(theirs) ? theirs : {};
+            var baseObj = isPlainStatsObject(base) ? base : {};
+
+            Object.keys(theirObj).forEach(function (key) {
+
+                // Clé présente dans la photo ET dans le stockage, mais
+                // plus chez nous : c'est une suppression faite ICI
+                // (fiche streamer effacée, nettoyage des fantômes). On
+                // la respecte au lieu de la faire réapparaître.
+                if (
+                    Object.prototype.hasOwnProperty.call(baseObj, key) &&
+                    !Object.prototype.hasOwnProperty.call(mine, key)
+                ) {
+                    return;
+                }
+
+                out[key] = mergeStatsValue(
+                    theirObj[key],
+                    Object.prototype.hasOwnProperty.call(mine, key)
+                        ? mine[key]
+                        : theirObj[key],
+                    baseObj[key],
+                    key,
+                    STATS_ARRAY_RULES[key] || rule
+                );
+
+            });
+
+            Object.keys(mine).forEach(function (key) {
+
+                if (Object.prototype.hasOwnProperty.call(out, key)) {
+                    return;
+                }
+
+                out[key] = mergeStatsValue(
+                    undefined,
+                    mine[key],
+                    baseObj[key],
+                    key,
+                    STATS_ARRAY_RULES[key] || rule
+                );
+
+            });
+
+            return out;
+
+        }
+
+        if (typeof mine === 'number') {
+
+            var theirNum = typeof theirs === 'number' ? theirs : 0;
+            var baseNum = typeof base === 'number' ? base : 0;
+
+            if (STATS_INSTANT_FIELDS[fieldName] === 'min') {
+                return Math.min(theirNum || mine, mine);
+            }
+
+            if (STATS_INSTANT_FIELDS[fieldName] === 'max') {
+                return Math.max(theirNum, mine);
+            }
+
+            var delta = mine - baseNum;
+
+            if (!delta) {
+                return theirNum;
+            }
+
+            // Le delta peut être négatif : supprimer une fiche
+            // streamer retranche son temps des totaux.
+            return Math.max(0, theirNum + delta);
+
+        }
+
+        // Chaînes, booléens, null : celui qui a changé depuis la
+        // photo l'emporte, sinon c'est le stockage qui fait foi.
+        if (typeof mine !== 'undefined' && mine !== base) {
+            return mine;
+        }
+
+        return typeof theirs === 'undefined' ? mine : theirs;
+
+    }
+
+    function mergeStatsWithStored(stored) {
+
+        var base = null;
+
+        try {
+            base = statsBaseline ? JSON.parse(statsBaseline) : null;
+        } catch (e) {
+            base = null;
+        }
+
+        // Remise à zéro ou import fait ailleurs : notre delta porte
+        // sur des chiffres qui n'existent plus, on le jette.
+        if (!base || (stored.epoch || 0) !== (base.epoch || 0)) {
+            return stored;
+        }
+
+        return mergeStatsValue(stored, pageStats, base, null, null);
+
+    }
+
+    // Absorbe la version d'un autre onglet SANS perdre nos propres
+    // incréments en attente.
+    function adoptStoredStats(stored) {
+
+        pageStats = mergeStatsWithStored(stored);
+
+        // La photo redevient « ce qu'il y a dans le stockage » :
+        // sans ça, la prochaine sauvegarde ré-appliquerait par-dessus
+        // les incréments de l'AUTRE onglet, qu'on vient d'absorber.
+        try {
+            statsBaseline = JSON.stringify(stored);
+        } catch (e) {
+            statsBaseline = null;
+        }
+
+    }
+
     var pageStats = loadStats();
+
+    try {
+        statsBaseline = JSON.stringify(pageStats);
+    } catch (e) {
+        statsBaseline = null;
+    }
 
     logEvent('info', 'Script démarré');
 
@@ -1156,15 +1534,84 @@
 
     var statsStorageState = { bytes: 0, full: false, warned: false };
 
-    function saveStatsNow() {
+    // `authoritative` : la version en mémoire REMPLACE le stockage
+    // au lieu de s'y fondre (remise à zéro, import d'une
+    // sauvegarde). Elle s'accompagne d'un epoch incrémenté, qui dit
+    // aux autres onglets de jeter leur delta.
+    function saveStatsNow(options) {
+
+        // Les onglets écrivent chacun leur tour : sans ça, deux
+        // relire-fusionner-réécrire simultanés se marcheraient
+        // dessus exactement comme avant.
+        if (navigator.locks && navigator.locks.request) {
+
+            try {
+
+                var pending = navigator.locks.request(
+                    'tp9-stats',
+                    function () {
+
+                        saveStatsUnlocked(options);
+
+                    }
+                );
+
+                if (pending && pending.catch) {
+
+                    pending.catch(function () {
+
+                        // Le verrou n'a pas pu être pris : on écrit
+                        // quand même, plutôt que de perdre la
+                        // sauvegarde. Rejouer est sans effet (le
+                        // delta retombe à zéro une fois la photo
+                        // mise à jour).
+                        saveStatsUnlocked(options);
+
+                    });
+
+                }
+
+                return;
+
+            } catch (e) {}
+
+        }
+
+        saveStatsUnlocked(options);
+
+    }
+
+    function saveStatsUnlocked(options) {
 
         try {
+
+            if (!(options && options.authoritative)) {
+
+                var raw = localStorage.getItem(STATS_KEY);
+
+                // Cas courant (personne d'autre n'a écrit depuis notre
+                // dernière sauvegarde) : rien à fusionner, et surtout
+                // pas de JSON.parse/stringify supplémentaire sur un
+                // objet qui peut peser plusieurs Mo.
+                if (raw !== statsBaseline) {
+
+                    adoptStoredStats(loadStats());
+
+                }
+
+            }
 
             var payload = JSON.stringify(pageStats);
 
             statsStorageState.bytes = payload.length;
 
             localStorage.setItem(STATS_KEY, payload);
+
+            // Uniquement après une écriture RÉUSSIE : sur stockage
+            // saturé, la photo doit rester celle de la dernière
+            // version réellement écrite, sinon le delta suivant
+            // serait faux.
+            statsBaseline = payload;
 
             if (statsStorageState.full) {
 
@@ -1251,7 +1698,7 @@
             return;
         }
 
-        pageStats = loadStats();
+        adoptStoredStats(loadStats());
 
         if (
             typeof statsDashboardVisible !== 'undefined' &&
@@ -2673,19 +3120,59 @@
     // Un lecteur flottant ouvert a la priorité : sur l'accueil par
     // exemple, l'aperçu en vedette apparaît avant lui dans le DOM et
     // serait sinon choisi à sa place.
+    // La <video> du lecteur perso ne compte JAMAIS comme une
+    // lecture Twitch. En mode direct elle est en display:none
+    // (rect 0 x 0) sous un habillage en position:fixed : elle
+    // cochait donc les deux critères de isMiniPlayerVideo et
+    // était prise pour le mini-player de Twitch. Comme elle est
+    // vide et en pause, getActivePlayback() renvoyait null et plus
+    // RIEN n'était comptabilisé tant que le lecteur perso restait
+    // ouvert — ni le temps de visionnage, ni la bande passante
+    // (créditée seulement si le channel remonté par le Worker
+    // correspond à getWatchedChannel()).
+    //
+    // Ça réglait aussi dvrSyncVolumeFromPlayer : quand le lecteur
+    // Twitch est remplacé (changement de qualité, pub), il rappelle
+    // dvrFindLivePlayer() alors que l'habillage existe déjà, et
+    // dvrLiveVideo devenait notre propre <video> vide — le volume
+    // et la pause du direct ne pilotaient plus rien.
+    function isOwnPlayerVideo(video) {
+
+        try {
+
+            return !!(video.closest && video.closest('.tp9dvr'));
+
+        } catch (e) {
+
+            return false;
+
+        }
+
+    }
+
     function findPlaybackVideo() {
 
         var videos = document.querySelectorAll('video');
 
+        var fallback = null;
+
         for (var i = 0; i < videos.length; i++) {
+
+            if (isOwnPlayerVideo(videos[i])) {
+                continue;
+            }
 
             if (isMiniPlayerVideo(videos[i])) {
                 return videos[i];
             }
 
+            if (!fallback) {
+                fallback = videos[i];
+            }
+
         }
 
-        return videos[0] || null;
+        return fallback;
 
     }
 
@@ -2867,6 +3354,92 @@
         }
 
         return minutes + ' min';
+
+    }
+
+
+    // ------------------------------------------------------------
+    // CE QUI BOUGE MAINTENANT S'AFFICHE AU DÉTAIL PRÈS
+    // ------------------------------------------------------------
+    //
+    // Un total arrondi à la minute et aux dizaines de Mo convient
+    // très bien à un historique : on le lit d'un coup d'œil et on
+    // n'a que faire de la troisième décimale de six mois de
+    // visionnage. Mais sur une chaîne EN COURS, c'est justement le
+    // dernier chiffre qu'on regarde — celui qui prouve que la mesure
+    // tourne. « 2h24 » fige pendant une minute entière, « 9,37 Go »
+    // pendant plusieurs minutes.
+    //
+    // D'où deux formats de plus, réservés aux lignes en cours.
+
+    function formatDurationPrecise(ms) {
+
+        var totalSeconds = Math.max(0, Math.floor(ms / 1000));
+
+        var hours = Math.floor(totalSeconds / 3600);
+        var minutes = Math.floor((totalSeconds % 3600) / 60);
+        var seconds = totalSeconds % 60;
+
+        if (hours > 0) {
+
+            return hours + 'h ' +
+                (minutes < 10 ? '0' : '') + minutes + 'm ' +
+                (seconds < 10 ? '0' : '') + seconds + 's';
+
+        }
+
+        if (minutes > 0) {
+
+            return minutes + 'm ' +
+                (seconds < 10 ? '0' : '') + seconds + 's';
+
+        }
+
+        return seconds + 's';
+
+    }
+
+    function formatBytesPrecise(bytes) {
+
+        if (!bytes) {
+            return '0 Ko';
+        }
+
+        var mb = bytes / (1024 * 1024);
+
+        // Même bascule à 1000 que formatBytes, une décimale de plus
+        // à chaque palier : c'est elle qui bouge à vue d'œil.
+        if (mb >= 1000) {
+            return (mb / 1000).toFixed(3) + ' Go';
+        }
+
+        if (mb >= 1) {
+            return mb.toFixed(2) + ' Mo';
+        }
+
+        return Math.round(bytes / 1024) + ' Ko';
+
+    }
+
+
+    // Une chaîne « en cours » est une chaîne dont les stats ont bougé
+    // à l'instant. lastSeen est réécrit à chaque tick de visionnage
+    // (5 s) et à chaque message tchat, et il passe par le
+    // localStorage : l'onglet dashboard, qui ne lit aucune vidéo,
+    // voit donc aussi bien qu'un autre ce que l'onglet d'à côté est
+    // en train de regarder.
+    //
+    // La fenêtre couvre le pire cas : un tick de 5 s, plus les 2 s
+    // de regroupement des écritures, plus un peu de marge quand le
+    // navigateur étire les minuteurs d'un onglet en arrière-plan.
+    var STREAMER_LIVE_WINDOW_MS = 15000;
+
+    function isStreamerLive(channel) {
+
+        var s = pageStats.streamers[channel];
+
+        return !!s &&
+            (Date.now() - (s.lastSeen || 0)) < STREAMER_LIVE_WINDOW_MS;
 
     }
 
@@ -3625,7 +4198,12 @@
 
                 mergeStatsFrom(incoming);
 
-                saveStatsNow();
+                // Une restauration remplace : le nouvel epoch dit aux
+                // autres onglets de jeter leur delta, qui porterait
+                // sinon sur des chiffres d'avant l'import.
+                pageStats.epoch = (pageStats.epoch || 0) + 1;
+
+                saveStatsNow({ authoritative: true });
 
                 logEvent('success', 'Statistiques restaurées depuis une sauvegarde');
 
@@ -3928,6 +4506,17 @@
                         // remplacée par celle d'un channel différent,
                         // qui ne matchait plus et masquait l'affichage
                         // jusqu'au prochain fetch de CET onglet).
+                        // Le test sur la chaîne ne suffit pas : à deux
+                        // onglets sur la MÊME chaîne, chacun prenait la
+                        // course de l'autre pour la sienne (carte "Lecture
+                        // actuelle" affichant le relais et la latence du
+                        // voisin, toast "Lecture directe" dans un onglet qui
+                        // passait pourtant par un relais). On le garde quand
+                        // même : il écarte les aperçus automatiques.
+                        if (event.data.tabId !== TAB_ID) {
+                            return;
+                        }
+
                         var isThisTabChannel =
                             event.data.channel &&
                             event.data.channel === getTestChannel();
@@ -4098,9 +4687,12 @@
 
                     }
 
+                    // Sans le filtre, chaque onglet twitch.tv ouvert
+                    // enregistrait et réécrivait le même événement.
                     if (
                         event.data &&
-                        event.data.type === 'log'
+                        event.data.type === 'log' &&
+                        event.data.tabId === TAB_ID
                     ) {
 
                         logEvent(
@@ -4276,19 +4868,6 @@
         </span>
         <span class="tp9-switch">
             <input type="checkbox" class="tp9-auto-backup">
-            <span class="tp9-switch-track"></span>
-        </span>
-    </label>
-
-    <label class="tp9-toggle-row tp9-dvr-row"
-        data-tp9-tip="Retour arrière"
-        data-tp9-tip-sub="Garde les dernières minutes de CETTE chaîne en mémoire pour pouvoir les rejouer. Ça coûte de la RAM, donc ça ne s'arme que là où tu le demandes. Le VOD, lui, reste utilisable sans rien armer quand le streamer en enregistre un.">
-        <span class="tp9-toggle-label">
-            <span class="tp9-toggle-icon">⏪</span>
-            <span class="tp9-dvr-label">Retour arrière</span>
-        </span>
-        <span class="tp9-switch">
-            <input type="checkbox" class="tp9-dvr">
             <span class="tp9-switch-track"></span>
         </span>
     </label>
@@ -4549,23 +5128,13 @@ document.addEventListener(
                 }
             );
 
-        dashboard
-            .querySelector('.tp9-dvr')
-            .addEventListener(
-                'change',
-                function (event) {
-
-                    setDvrChannelArmed(
-                        getTestChannel(),
-                        event.target.checked
-                    );
-
-                    renderDashboardSettings();
-
-                }
-            );
-
-
+        // L'interrupteur « Retour arrière » vivait ici ET dans les
+        // réglages du Player Custom, sur la même chaîne, avec le
+        // même effet. Un réglage PAR CHAÎNE n'a rien à faire dans un
+        // menu global : il est resté là où on s'en sert, dans la
+        // barre du lecteur (bouton ⚙). Ne restent ici que les deux
+        // réglages qui sont bien globaux — la profondeur gardée en
+        // mémoire, et l'ouverture automatique du lecteur.
         dashboard
             .querySelector('.tp9-dvr-auto')
             .addEventListener(
@@ -5721,68 +6290,6 @@ document.addEventListener(
         updateBackupUI();
 
 
-        // L'interrupteur porte le nom de la chaîne : il ne vaut
-        // que pour elle, et c'est la seule façon de le dire sans
-        // une ligne d'explication de plus.
-        var dvrChannel = getTestChannel();
-
-        // Là où la chaîne a un VOD exploitable, la mémoire ne sert
-        // à rien : l'interrupteur se grise et son infobulle dit
-        // pourquoi. Voir syncDvrMemorySuppression.
-        var dvrBlocked = dvrMemoryBlocked(dvrChannel);
-
-        var dvrToggle =
-            dashboard.querySelector('.tp9-dvr');
-
-        if (dvrToggle) {
-
-            dvrToggle.checked =
-                isDvrChannelArmed(dvrChannel) && !dvrBlocked;
-
-            dvrToggle.disabled = !dvrChannel || dvrBlocked;
-
-        }
-
-        var dvrRow =
-            dashboard.querySelector('.tp9-dvr-row');
-
-        if (dvrRow) {
-
-            dvrRow.style.opacity = dvrBlocked ? '.5' : '';
-
-            dvrRow.setAttribute(
-                'data-tp9-tip',
-                dvrBlocked
-                    ? 'Inutile sur cette chaîne'
-                    : 'Retour arrière'
-            );
-
-            dvrRow.setAttribute(
-                'data-tp9-tip-sub',
-                dvrBlocked
-                    ? 'Cette chaîne a un VOD exploitable : il remonte à tout le stream, ' +
-                        'là où la mémoire ne garderait que quelques minutes — en mangeant ' +
-                        'de la RAM en permanence. La capture est coupée tant que le VOD ' +
-                        'est là, et elle repartira toute seule s\'il disparaît.'
-                    : 'Garde les dernières minutes de CETTE chaîne en mémoire pour pouvoir ' +
-                        'les rejouer. Ça coûte de la RAM, donc ça ne s\'arme que là où tu le ' +
-                        'demandes. Le VOD, lui, reste utilisable sans rien armer.'
-            );
-
-        }
-
-        var dvrLabel =
-            dashboard.querySelector('.tp9-dvr-label');
-
-        if (dvrLabel) {
-
-            dvrLabel.textContent =
-                dvrChannel
-                    ? 'Retour arrière · ' + dvrChannel
-                    : 'Retour arrière';
-
-        }
-
         var dvrRange =
             dashboard.querySelector('.tp9-dvr-range');
 
@@ -5809,17 +6316,10 @@ document.addEventListener(
 
         }
 
-        var dvrDepth =
-            dashboard.querySelector('.tp9-dvr-depth');
-
-        if (dvrDepth) {
-
-            dvrDepth.classList.toggle(
-                'tp9-dvr-depth-idle',
-                !isDvrChannelArmed(dvrChannel) || dvrBlocked
-            );
-
-        }
+        // Plus grisé : c'est un réglage GLOBAL, et le menu n'a plus
+        // l'interrupteur qui permettrait de le dégriser. Il se lit
+        // et se règle quand on veut ; il s'appliquera aux chaînes
+        // armées depuis le lecteur.
 
         var dvrAuto =
             dashboard.querySelector('.tp9-dvr-auto');
@@ -6200,38 +6700,8 @@ function showAddProxyForm() {
 
                 }
 
-                try {
-
-                    /*
-                     * On remplace temporairement {channel}
-                     * uniquement pour permettre à URL()
-                     * de valider correctement l'adresse.
-                     *
-                     * Le proxy enregistré conserve
-                     * évidemment {channel}.
-                     */
-
-                    var testURL =
-                        url.replace(
-                            '{channel}',
-                            'testchannel'
-                        );
-
-                    var parsed =
-                        new URL(testURL);
-
-                    if (
-                        parsed.protocol !==
-                            'http:' &&
-                        parsed.protocol !==
-                            'https:'
-                    ) {
-
-                        throw new Error();
-
-                    }
-
-                } catch (e) {
+                // Même contrôle qu'à l'import : voir isProxyURLValid.
+                if (!isProxyURLValid(url)) {
 
                     error.textContent =
                         'URL invalide.';
@@ -8710,6 +9180,119 @@ function showAddProxyForm() {
     var dvrVolumeMuted = dvrVolumeSaved.muted;
     var dvrVolumeKnown = dvrVolumeSaved.known;
 
+    // ------------------------------------------------------------
+    // LE VOLUME SUIT D'UN STREAM À L'AUTRE
+    // ------------------------------------------------------------
+    //
+    // Notre niveau est retenu sur le disque et imposé aux deux
+    // lecteurs. Seulement Twitch garde AUSSI le sien de son côté, et
+    // il le réapplique à son lecteur quelques secondes après un
+    // changement de chaîne — donc APRÈS nous. Le stream repartait
+    // alors au volume de Twitch, et pire : dvrSyncVolumeFromPlayer
+    // prenait cette restauration pour un réglage de l'utilisateur et
+    // l'adoptait, effaçant le nôtre pour de bon.
+    //
+    // Deux réponses, qui se complètent :
+    //
+    //   - on écrit notre niveau dans le réglage de Twitch lui-même,
+    //     pour que ce qu'il restaure SOIT déjà le nôtre ;
+    //   - et pendant quelques secondes après un changement de chaîne
+    //     ou un remplacement de lecteur, on IMPOSE au lieu d'adopter,
+    //     le temps que sa restauration ait eu lieu.
+
+    var TWITCH_VOLUME_KEY = 'video-volume';
+    var TWITCH_MUTED_KEY = 'video-muted';
+
+    // Les clés de Twitch ne nous appartiennent pas : on ne les
+    // réécrit que dans le format qu'on y trouve déjà, et jamais
+    // celle qu'on n'a pas vue. Au pire on n'écrit rien, et la
+    // fenêtre de garde ci-dessous suffit.
+    function dvrMirrorVolumeToTwitch() {
+
+        try {
+
+            var savedLevel = localStorage.getItem(TWITCH_VOLUME_KEY);
+
+            if (
+                savedLevel === null ||
+                /^[0-9.]+$/.test(savedLevel.trim())
+            ) {
+
+                localStorage.setItem(
+                    TWITCH_VOLUME_KEY,
+                    String(dvrVolumeLevel)
+                );
+
+            }
+
+            var savedMuted = localStorage.getItem(TWITCH_MUTED_KEY);
+
+            if (savedMuted === null) {
+                return;
+            }
+
+            var parsed = null;
+
+            try {
+                parsed = JSON.parse(savedMuted);
+            } catch (e) {
+                return;
+            }
+
+            if (typeof parsed === 'boolean') {
+
+                localStorage.setItem(
+                    TWITCH_MUTED_KEY,
+                    String(dvrVolumeMuted)
+                );
+
+                return;
+
+            }
+
+            if (parsed && typeof parsed === 'object') {
+
+                parsed.default = dvrVolumeMuted;
+
+                localStorage.setItem(
+                    TWITCH_MUTED_KEY,
+                    JSON.stringify(parsed)
+                );
+
+            }
+
+        } catch (e) {}
+
+    }
+
+    // Fenêtre pendant laquelle NOTRE niveau l'emporte sur ce que le
+    // lecteur Twitch affiche : sa restauration arrive après la
+    // nôtre, et il ne faut surtout pas la prendre pour un réglage.
+    var DVR_VOLUME_GUARD_MS = 6000;
+
+    var dvrVolumeGuardUntil = 0;
+
+    function dvrArmVolumeGuard() {
+
+        dvrVolumeGuardUntil = Date.now() + DVR_VOLUME_GUARD_MS;
+
+    }
+
+    function dvrVolumeGuarded() {
+
+        return Date.now() < dvrVolumeGuardUntil;
+
+    }
+
+    function dvrVolumeDrifted(video) {
+
+        return (
+            Math.abs((video.volume || 0) - dvrVolumeLevel) > 0.005 ||
+            !!video.muted !== dvrVolumeMuted
+        );
+
+    }
+
     // Groupé : la molette part à chaque cran, écrire le localStorage
     // à chaque pour cent n'aurait aucun intérêt.
     var dvrVolumeSaveTimer = null;
@@ -8738,6 +9321,8 @@ function showAddProxyForm() {
                     );
 
                 } catch (e) {}
+
+                dvrMirrorVolumeToTwitch();
 
             },
             400
@@ -10988,6 +11573,10 @@ function showAddProxyForm() {
             // qui coupait un son qu'on continuait d'entendre.
             dvrFindLivePlayer();
 
+            // Twitch va remettre SON volume sur le lecteur neuf :
+            // c'est le nôtre qui doit rester.
+            dvrArmVolumeGuard();
+
             dvrPushVolume();
 
             return;
@@ -11001,9 +11590,92 @@ function showAddProxyForm() {
             return;
         }
 
+        // Fenêtre de garde : ce que le lecteur affiche n'est pas un
+        // réglage de l'utilisateur, c'est la restauration de Twitch.
+        if (dvrVolumeGuarded()) {
+
+            if (
+                dvrVolumeKnown &&
+                dvrLiveVideo &&
+                dvrVolumeDrifted(dvrLiveVideo)
+            ) {
+                dvrPushVolume();
+            }
+
+            return;
+
+        }
+
         if (dvrAdoptVolumeFrom(dvrLiveVideo)) {
             dvrPushVolume();
         }
+
+    }
+
+
+    // Le lecteur perso peut très bien être fermé : c'est le même
+    // son, il doit suivre quand même. Sans ça, changer de chaîne
+    // barre fermée rendait la main au volume de Twitch, et le
+    // niveau réglé dans notre barre ne revenait qu'à sa
+    // réouverture.
+    var dvrVolumeWatchedVideo = null;
+
+    function dvrKeepTwitchVolume() {
+
+        // Barre ouverte : c'est dvrSyncVolumeFromPlayer qui pilote,
+        // quatre fois par seconde.
+        if (dvrOverlay) {
+            return;
+        }
+
+        var video = findPlaybackVideo();
+
+        if (!video) {
+
+            dvrVolumeWatchedVideo = null;
+
+            return;
+
+        }
+
+        if (video !== dvrVolumeWatchedVideo) {
+
+            dvrVolumeWatchedVideo = video;
+
+            dvrArmVolumeGuard();
+
+        }
+
+        // Rien n'a jamais été réglé dans notre barre : c'est le son
+        // de Twitch qui fait foi, on se contente de le retenir.
+        if (!dvrVolumeKnown) {
+
+            dvrAdoptVolumeFrom(video);
+
+            return;
+
+        }
+
+        if (!dvrVolumeDrifted(video)) {
+            return;
+        }
+
+        if (dvrVolumeGuarded()) {
+
+            try {
+
+                video.volume = dvrVolumeLevel;
+                video.muted = dvrVolumeMuted;
+
+            } catch (e) {}
+
+            return;
+
+        }
+
+        // Hors fenêtre de garde, c'est l'utilisateur qui a touché
+        // aux commandes de Twitch : on le suit, et on le retient.
+        dvrAdoptVolumeFrom(video);
 
     }
 
@@ -13222,7 +13894,10 @@ function showAddProxyForm() {
                         ? ' class="tp9dvr-menu-active"'
                         : '') +
                     '>' +
-                    dvrLevelName(entry.level) +
+                    // Sans résolution, dvrLevelName rend l'attribut NAME
+                    // de la playlist : une chaîne qui vient du réseau,
+                    // donc jamais concaténée telle quelle dans innerHTML.
+                    escapeHTML(dvrLevelName(entry.level)) +
                     '</button>'
                 );
 
@@ -14781,17 +15456,23 @@ function showAddProxyForm() {
 
         dvrButton.type = 'button';
 
-        // Une flèche qui tourne : elle dit « revenir en arrière »
-        // sans légende, là où le double triangle se lisait comme un
-        // retour au début. Verte quand le lecteur perso est ouvert,
-        // grise sinon — l'état se lit sans survoler.
+        // Un écran avec sa barre de lecture et son triangle : ce
+        // bouton n'ouvre pas « un retour arrière », il ouvre un
+        // LECTEUR complet (qualité, volume, pause sur le direct,
+        // retour arrière). La flèche qui tournait ne racontait qu'un
+        // dixième de ce qu'il y a derrière. Verte quand le lecteur
+        // perso est ouvert, grise sinon — l'état se lit sans
+        // survoler.
         dvrButton.innerHTML =
             '<svg width="17" height="17" viewBox="0 0 24 24"' +
-            ' fill="none" stroke="currentColor" stroke-width="2.1"' +
+            ' fill="none" stroke="currentColor" stroke-width="2"' +
             ' stroke-linecap="round" stroke-linejoin="round"' +
             ' aria-hidden="true">' +
-            '<path d="M3 5v6h6"/>' +
-            '<path d="M3.6 15a9 9 0 1 0 2.1-9.4L3 8.5"/>' +
+            '<rect x="2.6" y="4.4" width="18.8" height="15.2" rx="2.4"/>' +
+            '<path d="M2.6 15.2h18.8"/>' +
+            '<path d="M10 8.2l4.2 2.4-4.2 2.4z"' +
+            ' fill="currentColor" stroke-width="1.4"/>' +
+            '<path d="M5.4 17.4h5.2"/>' +
             '</svg>';
 
         dvrButton.style.visibility = 'hidden';
@@ -14811,10 +15492,6 @@ function showAddProxyForm() {
 
                     return;
 
-                }
-
-                if (dvrButton.disabled) {
-                    return;
                 }
 
                 openDvr();
@@ -14869,21 +15546,25 @@ function showAddProxyForm() {
 
         var armed = isDvrChannelArmed(channel);
 
-        // La moindre seconde en mémoire vaut mieux que rien : le
-        // retard demandé est de toute façon plafonné à ce qui
-        // existe (voir dvrGoToOffset).
-        var available =
-            bufferDepth > 0 ||
-            !!vodInfo;
+        // Le lecteur perso s'ouvre TOUJOURS. Il était grisé tant
+        // qu'il n'y avait ni VOD ni mémoire, comme s'il ne servait
+        // qu'à reculer — alors que c'est une barre de lecture
+        // complète : qualité, volume, pause sur le direct, et
+        // l'accès à ses propres réglages, où l'on arme justement la
+        // mémoire de la chaîne. Deux conséquences absurdes :
+        //
+        //   - sur une chaîne sans VOD ni mémoire, impossible de
+        //     l'ouvrir du tout ;
+        //   - l'ayant refermé sur une telle chaîne, impossible de le
+        //     ROUVRIR sans recharger la page (ouvert, il restait
+        //     cliquable puisque c'est lui qui referme).
+        //
+        // Ce qu'il y a à rejouer, ou pas, se lit maintenant dans
+        // l'infobulle, et la timeline se montre d'elle-même quand
+        // elle a quelque chose à montrer.
+        dvrButton.disabled = false;
 
-        // Ouvert, il reste cliquable quoi qu'il arrive : c'est lui
-        // qui referme.
-        dvrButton.disabled = !available && !dvrOverlay;
-
-        dvrButton.classList.toggle(
-            'tp9-dvr-off',
-            dvrButton.disabled
-        );
+        dvrButton.classList.remove('tp9-dvr-off');
 
         dvrButton.classList.toggle(
             'tp9-dvr-armed',
@@ -14891,13 +15572,13 @@ function showAddProxyForm() {
         );
 
         dvrButton.dataset.tp9Tip = dvrOverlay
-            ? 'Fermer le lecteur perso'
-            : 'Retour arrière';
+            ? 'Fermer le Player Custom'
+            : 'Player Custom';
 
         if (dvrOverlay) {
 
             dvrButton.dataset.tp9TipSub =
-                'Rend la main au lecteur Twitch et à son son.';
+                'Rend la main à la barre du lecteur Twitch et à son son.';
 
             dvrButton.style.visibility = 'visible';
 
@@ -14956,9 +15637,17 @@ function showAddProxyForm() {
         } else {
 
             dvrButton.dataset.tp9TipSub =
-                'Aucun VOD exploitable sur cette chaîne. Arme le retour arrière dans le menu (Alt + P) pour garder les dernières minutes en mémoire.';
+                'Aucun VOD exploitable sur cette chaîne, et la mémoire n\'est pas armée : ouvre-le et arme-la dans ses réglages (⚙) pour pouvoir reculer.';
 
         }
+
+        // Posée devant, toujours : ce bouton n'ouvre pas seulement
+        // un retour arrière, et il s'ouvre même quand il n'y a rien
+        // à rejouer. La phrase construite au-dessus dit, elle, ce
+        // qu'il y a de disponible sur CETTE chaîne.
+        dvrButton.dataset.tp9TipSub =
+            'Remplace la barre de Twitch : qualité, volume, pause sur le direct et retour arrière. ' +
+            dvrButton.dataset.tp9TipSub;
 
         dvrButton.style.visibility = 'visible';
 
@@ -20575,6 +21264,82 @@ dashboardButton.style.visibility =
             }
 
 
+            /* En cours de lecture. Un fond vert très dilué plutôt
+               qu'une couleur de texte : la ligne se repère en
+               balayant le tableau, sans rien rendre moins lisible,
+               et le liseré de gauche la retrouve même quand le
+               tableau défile sous l'en-tête. */
+
+            .tp9s-table-row.tp9s-row-live {
+
+                background:
+                    linear-gradient(
+                        90deg,
+                        rgba(0, 208, 132, .16) 0%,
+                        rgba(0, 208, 132, .05) 45%,
+                        rgba(0, 208, 132, 0) 100%
+                    );
+
+                box-shadow: inset 2px 0 0 #00d084;
+
+            }
+
+            .tp9s-table-row.tp9s-row-live .tp9s-td-strong {
+
+                color: #4dffb8;
+
+            }
+
+            /* Le point vert n'existe que sur ces lignes-là : ailleurs
+               il ne dirait rien, et il prendrait quand même sa place
+               à côté du nom. */
+
+            .tp9s-live-dot {
+
+                display: none;
+
+                width: 7px;
+                height: 7px;
+
+                flex: none;
+
+                border-radius: 50%;
+
+                background: #00d084;
+
+            }
+
+            .tp9s-row-live .tp9s-live-dot {
+
+                display: inline-block;
+
+                animation: tp9s-live-pulse 1.6s ease-in-out infinite;
+
+            }
+
+            @keyframes tp9s-live-pulse {
+
+                0%, 100% {
+                    opacity: 1;
+                    box-shadow: 0 0 0 0 rgba(0, 208, 132, .55);
+                }
+
+                50% {
+                    opacity: .55;
+                    box-shadow: 0 0 0 4px rgba(0, 208, 132, 0);
+                }
+
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+
+                .tp9s-row-live .tp9s-live-dot {
+                    animation: none;
+                }
+
+            }
+
+
             .tp9s-streamer-delete {
 
                 width: 26px;
@@ -23816,6 +24581,11 @@ dashboardButton.style.visibility =
 
         setInterval(refreshLiveThroughput, 5000);
 
+        // Une seconde : c'est le pas du chiffre le plus fin affiché.
+        // La fonction sort d'elle-même dès que l'onglet Streamers
+        // n'est pas à l'écran.
+        setInterval(refreshLiveStreamerRows, 1000);
+
         // Délégué : le contenu (cartes, tableaux, ...) est
         // reconstruit à chaque rendu, on écoute donc au niveau du
         // conteneur persistant plutôt que sur chaque élément.
@@ -24198,9 +24968,16 @@ dashboardButton.style.visibility =
             return;
         }
 
+        var previousEpoch = pageStats.epoch || 0;
+
         pageStats = defaultStats();
 
-        saveStatsNow();
+        // Le nouvel epoch dit aux autres onglets de jeter ce qu'ils
+        // gardaient en mémoire : sinon leur prochaine sauvegarde
+        // ferait réapparaître une partie des chiffres effacés.
+        pageStats.epoch = previousEpoch + 1;
+
+        saveStatsNow({ authoritative: true });
 
         logEvent('warn', 'Statistiques réinitialisées');
 
@@ -24533,6 +25310,76 @@ dashboardButton.style.visibility =
     // affiché changerait, y compris pour le faire DISPARAÎTRE quand
     // la lecture s'arrête (plus aucun message n'arrive alors : d'où
     // le minuteur, qui est le seul à pouvoir constater la péremption).
+    // Les lignes en cours se réécrivent À LA CELLULE, une fois par
+    // seconde. Un renderStatsDashboard(true) complet referait tout
+    // le tableau au même rythme — l'infobulle survolée, la colonne
+    // triée et le défilement compris — pour deux nombres qui
+    // changent.
+    function refreshLiveStreamerRows() {
+
+        if (
+            !statsDashboard ||
+            !statsDashboardVisible ||
+            statsActiveTab !== 'streamers'
+        ) {
+            return;
+        }
+
+        var rows =
+            statsDashboard.querySelectorAll('.tp9s-table-row-streamers[data-channel]');
+
+        for (var i = 0; i < rows.length; i++) {
+
+            var row = rows[i];
+
+            var channel = row.getAttribute('data-channel');
+
+            var s = pageStats.streamers[channel];
+
+            if (!s) {
+                continue;
+            }
+
+            var live = isStreamerLive(channel);
+
+            row.classList.toggle('tp9s-row-live', live);
+
+            var watchCell = row.querySelector('[data-tp9-live-watch]');
+
+            if (watchCell) {
+
+                var watchText = live
+                    ? formatDurationPrecise(s.watchTimeMs)
+                    : formatDuration(s.watchTimeMs);
+
+                // Comparé avant écriture : réécrire un textContent
+                // identique casse une sélection de texte en cours.
+                if (watchCell.textContent !== watchText) {
+                    watchCell.textContent = watchText;
+                }
+
+            }
+
+            var bwCell = row.querySelector('[data-tp9-live-bw]');
+
+            if (bwCell) {
+
+                var bwHTML = withUnit(
+                    live
+                        ? formatBytesPrecise(s.bandwidthBytes)
+                        : formatBytes(s.bandwidthBytes)
+                );
+
+                if (bwCell.innerHTML !== bwHTML) {
+                    bwCell.innerHTML = bwHTML;
+                }
+
+            }
+
+        }
+
+    }
+
     var lastThroughputText = null;
 
     function refreshLiveThroughput() {
@@ -26343,18 +27190,33 @@ dashboardButton.style.visibility =
                     '</div>'
                 );
 
+            var live = isStreamerLive(channel);
+
             return (
-                '<div class="tp9s-table-row tp9s-table-row-streamers">' +
+                '<div class="tp9s-table-row tp9s-table-row-streamers' +
+                    (live ? ' tp9s-row-live' : '') +
+                    '" data-channel="' + escapeHTML(channel) + '">' +
                     '<div class="tp9s-td tp9s-td-rank">' + sortRankHTML(index) + '</div>' +
                     '<div class="tp9s-td tp9s-td-name-flex">' +
                         avatarHTML +
                         '<span>' + escapeHTML(displayName) + '</span>' +
+                        // Le point vert bat au rythme du tick de
+                        // visionnage : il dit que la mesure tourne,
+                        // pas seulement que la chaîne est en ligne.
+                        '<span class="tp9s-live-dot"' +
+                            ' data-tp9-tip="En cours de lecture"' +
+                            ' data-tp9-tip-sub="Le temps regardé et la bande passante de cette ligne sont affichés à la seconde et au Ko près tant que la lecture dure."' +
+                            '></span>' +
                     '</div>' +
                     // La colonne qui porte le classement par défaut :
                     // c'est elle qu'on vient lire, elle ne doit pas
                     // avoir le même poids que le reste de la ligne.
-                    '<div class="tp9s-td tp9s-td-strong">' +
-                        escapeHTML(formatDuration(s.watchTimeMs)) +
+                    '<div class="tp9s-td tp9s-td-strong" data-tp9-live-watch>' +
+                        escapeHTML(
+                            live
+                                ? formatDurationPrecise(s.watchTimeMs)
+                                : formatDuration(s.watchTimeMs)
+                        ) +
                     '</div>' +
                     '<div class="tp9s-td">' +
                         (
@@ -26368,7 +27230,13 @@ dashboardButton.style.visibility =
                         '<span class="tp9s-progress">' +
                             '<span class="tp9s-progress-fill" style="width:' + bwPercent + '%;background:' + avatarColor + '"></span>' +
                         '</span>' +
-                        withUnit(formatBytes(s.bandwidthBytes)) +
+                        '<span data-tp9-live-bw>' +
+                            withUnit(
+                                live
+                                    ? formatBytesPrecise(s.bandwidthBytes)
+                                    : formatBytes(s.bandwidthBytes)
+                            ) +
+                        '</span>' +
                     '</div>' +
                     '<div class="tp9s-td">' +
                         (
@@ -27778,7 +28646,10 @@ dashboardButton.style.visibility =
         'activate',
         'checkout',
         'redeem',
-        'directory',
+
+        // Sans elles, un auto-test partait sur la « chaîne » login.
+        'login',
+        'signup',
 
         // URL bidon utilisée par openStatsDashboardInNewTab().
         'tp9proxydashboard'
@@ -28219,10 +29090,12 @@ dashboardButton.style.visibility =
         }
 
 
+        // Un id importé qui contient un guillemet faisait lever une
+        // exception au sélecteur.
         var element =
             dashboard.querySelector(
                 '[data-status="' +
-                id +
+                (window.CSS && CSS.escape ? CSS.escape(id) : id) +
                 '"]'
             );
 
@@ -28368,6 +29241,7 @@ dashboardButton.style.visibility =
 
                 __tp_bc.postMessage({
                     type: 'log',
+                    tabId: __tp_tabId,
                     level: 'info',
                     msg: 'Worker HLS patché'
                 });
@@ -28563,10 +29437,35 @@ dashboardButton.style.visibility =
                             );
 
 
-                        var fetchInit =
-                            init
-                                ? Object.assign({}, init, { signal: controller.signal })
-                                : { signal: controller.signal };
+                        // Les relais sont des TIERS : on ne leur
+                        // transmet ni les en-têtes, ni les cookies, ni
+                        // le referrer de la requête usher de Twitch.
+                        // Et on n'écrase plus son éventuel signal
+                        // d'annulation : on y ajoute le nôtre.
+                        var fetchInit = {
+                            credentials: "omit",
+                            referrerPolicy: "no-referrer",
+                            cache: "no-store",
+                            signal: controller.signal
+                        };
+
+                        if (init && init.signal) {
+
+                            try {
+
+                                if (AbortSignal.any) {
+
+                                    fetchInit.signal =
+                                        AbortSignal.any([
+                                            init.signal,
+                                            controller.signal
+                                        ]);
+
+                                }
+
+                            } catch(e) {}
+
+                        }
 
 
                         __tp_originalFetch.call(
@@ -28633,7 +29532,13 @@ dashboardButton.style.visibility =
                 }
 
                 return (
-                    /\.(ts|m4s|mp4|m4v|m4a|aac|fmp4)([?#]|$)/i.test(lowerURL)
+                    // Double antislash VOLONTAIRE : ce code part dans un
+                    // template literal, le Worker recevrait sinon un point
+                    // libre, qui accepte n'importe quel caractère (toute
+                    // URL finissant par "ts", "aac", "mp4"... était comptée
+                    // comme un segment vidéo). Même raison que les
+                    // \.m3u8 du reste de ce patch.
+                    /\\.(ts|m4s|mp4|m4v|m4a|aac|fmp4)([?#]|$)/i.test(lowerURL)
                     ||
                     lowerURL.indexOf("/v1/segment/") >= 0
                 );
@@ -29586,6 +30491,7 @@ dashboardButton.style.visibility =
 
                                                     __tp_bc.postMessage({
                                                         type: "activeProxy",
+                                                        tabId: __tp_tabId,
                                                         proxyId: proxy.id,
                                                         proxyName: proxy.name,
                                                         channel: channel,
@@ -29659,6 +30565,7 @@ dashboardButton.style.visibility =
 
                                 __tp_bc.postMessage({
                                     type: "activeProxy",
+                                    tabId: __tp_tabId,
                                     proxyId: null,
                                     proxyName: null,
                                     channel: channel,
@@ -29676,6 +30583,7 @@ dashboardButton.style.visibility =
 
                                 __tp_bc.postMessage({
                                     type: "log",
+                                    tabId: __tp_tabId,
                                     level: "error",
                                     msg: "Tous les proxys ont échoué pour " + channel
                                 });
@@ -30039,6 +30947,12 @@ dashboardButton.style.visibility =
 
         lastKnownChannel = channel;
 
+        // Twitch réapplique SON volume au lecteur quelques secondes
+        // après la bascule, et le lecteur n'est pas forcément
+        // remplacé : le changement de chaîne est alors le seul
+        // signal. Voir dvrKeepTwitchVolume.
+        dvrArmVolumeGuard();
+
         // Le passé d'une autre chaîne n'a plus rien à faire à
         // l'écran, et son buffer encore moins en mémoire. Partir
         // vers une page sans lecteur compte tout autant : c'est
@@ -30344,6 +31258,9 @@ dashboardButton.style.visibility =
         // Pause faite sur le lecteur de Twitch : on ne peut pas
         // écouter l'élément, il est remplacé en cours de route.
         setInterval(watchNativeTwitchPause, 1000);
+
+        // Même raison pour le volume, barre fermée.
+        setInterval(dvrKeepTwitchVolume, 1000);
 
         startAutoBackup();
 
