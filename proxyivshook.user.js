@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch HLS Proxy
 // @namespace    twitch-proxy-ivs
-// @version      1.8.1
+// @version      1.8.2
 // @author       razeNFR
 // @description  Twitch HLS via plusieurs proxys - Dashboard statistiques (nouvel onglet, design amélioré) + fallback automatique + résultats persistants + proxys personnalisés
 // @match        https://www.twitch.tv/*
@@ -33,7 +33,7 @@
         Math.random().toString(36).substring(2, 9);
 
     // Doit être tenu à jour avec le @version de l'en-tête du script.
-    var CURRENT_VERSION = '1.8.1';
+    var CURRENT_VERSION = '1.8.2';
 
     // Même URL que @updateURL : contient toujours la dernière version
     // publiée. On la relit nous-même (plutôt que de compter sur le
@@ -11112,8 +11112,11 @@ function showAddProxyForm() {
         if (!dvrHintBox) {
             dvrHintBox = document.createElement('div');
             dvrHintBox.className = 'tp9dvr-vol-hint';
-            document.body.appendChild(dvrHintBox);
         }
+        // En plein écran, seul l'élément affiché est dessiné : le
+        // carton doit y vivre, sinon il existe mais reste invisible.
+        var hintHost = document.fullscreenElement || document.body;
+        if (dvrHintBox.parentNode !== hintHost) hintHost.appendChild(dvrHintBox);
         var rect = player.getBoundingClientRect();
         dvrHintBox.style.left = (rect.left + rect.width / 2) + 'px';
         dvrHintBox.style.top = (rect.top + rect.height / 2) + 'px';
@@ -11394,6 +11397,27 @@ function showAddProxyForm() {
         var back = dvrQuery('.tp9dvr-back');
         var fwd = dvrQuery('.tp9dvr-fwd');
         var speed = dvrQuery('.tp9dvr-speed');
+        // Chaîne avec VOD : la mémoire ne capture rien, ses réglages
+        // n'ont plus d'objet. aria-disabled plutôt que disabled : un
+        // bouton désactivé ne reçoit plus la souris, et l'infobulle
+        // qui explique pourquoi ne s'afficherait jamais.
+        var settingsBtn = dvrQuery('.tp9dvr-settings');
+        if (settingsBtn) {
+            var memoryUseless = dvrMemoryBlocked(dvrChannelInUse);
+            var offFlag = memoryUseless ? 'true' : 'false';
+            if (settingsBtn.getAttribute('aria-disabled') !== offFlag) {
+                settingsBtn.setAttribute('aria-disabled', offFlag);
+                settingsBtn.classList.toggle('tp9dvr-btn-off', memoryUseless);
+                settingsBtn.dataset.tp9Tip = memoryUseless
+                    ? 'Réglages du retour arrière · inutiles ici'
+                    : 'Réglages du retour arrière';
+                settingsBtn.dataset.tp9TipSub = memoryUseless
+                    ? 'Cette chaîne a un VOD : il couvre déjà tout le stream, la mémoire est coupée et n\'a rien à régler.'
+                    : 'Armer la mémoire de cette chaîne et régler sa profondeur.';
+                if (memoryUseless) dvrCloseSettingsMenu();
+                refreshTooltipText(settingsBtn);
+            }
+        }
         if (back && back.disabled !== !playable) {
             back.disabled = !playable;
         }
@@ -13533,6 +13557,12 @@ function showAddProxyForm() {
             return;
         }
 
+        // Grisée (la chaîne a un VOD) : le clic ne fait rien.
+        if (dvrMemoryBlocked(dvrSettingsChannel())) {
+            dvrCloseSettingsMenu();
+            return;
+        }
+
         var open = menu.classList.contains('tp9dvr-menu-on');
 
         dvrCloseMenu();
@@ -14029,6 +14059,9 @@ function showAddProxyForm() {
             'body .tp9dvr-native-info .tp9dvr-live{border-radius:var(--border-radius-medium,4px)}' +
             'body .tp9dvr-native-info :is(.tp9dvr-back,.tp9dvr-fwd,.tp9dvr-settings) svg{width:24px!important;height:24px!important}' +
             'body .tp9dvr-native-info :is(.tp9dvr-back,.tp9dvr-fwd):disabled{opacity:.35;cursor:default}' +
+            'body .tp9dvr-native-info .tp9dvr-settings.tp9dvr-btn-off{opacity:.35;cursor:default}' +
+            'body .tp9dvr-native-info .tp9dvr-settings.tp9dvr-btn-off:hover,' +
+            'body .tp9dvr-native-info .tp9dvr-settings.tp9dvr-btn-off:active{background:transparent!important}' +
             '.tp9dvr-menu.tp9dvr-floating{position:fixed;z-index:100000;max-height:60vh}' +
             '.tp9dvr-floating.tp9dvr-settings-menu{width:300px;min-width:300px;max-width:300px}' +
             '.tp9dvr-floating .tp9dvr-set-hint{min-height:2.8em}' +
@@ -15075,6 +15108,100 @@ dashboardButton.style.visibility =
     // RECHERCHE DU BOUTON FOLLOW / COEUR
     // ============================================================
 
+    // Colonne du tchat : on n'y cherche jamais le bouton Suivre.
+    // En mode cinéma, un bouton du tchat passait pour lui et le
+    // bouton du menu proxy se retrouvait posé au milieu des messages.
+    var CHAT_COLUMN_SELECTOR =
+        '.channel-root__right-column, .chat-shell, .chat-room, .stream-chat,' +
+        '[data-test-selector="chat-room-component-layout"],' +
+        '[data-a-target="right-column-chat-bar"]';
+
+    function isInChatColumn(element) {
+
+        try {
+
+            if (element.closest(CHAT_COLUMN_SELECTOR)) {
+                return true;
+            }
+
+            // Les noms de classe du tchat changent selon le mode
+            // d'affichage : on se fie aussi à la géométrie. Tout ce
+            // qui commence à droite du lecteur est dans la colonne
+            // du tchat.
+            var player = document.querySelector('.video-player');
+
+            if (player) {
+
+                var frame = player.getBoundingClientRect();
+                var box = element.getBoundingClientRect();
+
+                if (
+                    frame.width > 400 &&
+                    box.width > 0 &&
+                    box.left >= frame.right - 1
+                ) {
+                    return true;
+                }
+
+            }
+
+            return false;
+
+        } catch (e) {
+            return false;
+        }
+
+    }
+
+
+    // Mode cinéma : l'étiquette du bouton de Twitch passe à
+    // « Quitter le mode cinéma », et le lecteur occupe toute la
+    // hauteur de la fenêtre (la barre du haut du site disparaît).
+    // L'un ou l'autre suffit : on ne dépend plus de la position du
+    // bouton Suivre, qui peut être caché.
+    function isTheatreMode() {
+
+        if (document.fullscreenElement) {
+            return false;
+        }
+
+        try {
+
+            var toggle = document.querySelector(
+                '[data-a-target="player-theatre-mode-button"]'
+            );
+
+            var label = toggle
+                ? (toggle.getAttribute('aria-label') || '').toLowerCase()
+                : '';
+
+            if (/quitter|exit|désactiver/.test(label)) {
+                return true;
+            }
+
+            var player = document.querySelector('.video-player');
+
+            if (player) {
+
+                var frame = player.getBoundingClientRect();
+
+                if (
+                    frame.width > 400 &&
+                    frame.top <= 2 &&
+                    frame.bottom >= window.innerHeight - 2
+                ) {
+                    return true;
+                }
+
+            }
+
+        } catch (e) {}
+
+        return false;
+
+    }
+
+
     function findFollowButton() {
 
         var selectors = [
@@ -15102,18 +15229,21 @@ dashboardButton.style.visibility =
             i++
         ) {
 
-            var element =
-                document.querySelector(
+            var candidates =
+                document.querySelectorAll(
                     selectors[i]
                 );
 
+            for (var c = 0; c < candidates.length; c++) {
 
-            if (
-                element &&
-                element.offsetParent !== null
-            ) {
+                if (
+                    candidates[c].offsetParent !== null &&
+                    !isInChatColumn(candidates[c])
+                ) {
 
-                return element;
+                    return candidates[c];
+
+                }
 
             }
 
@@ -15137,7 +15267,8 @@ dashboardButton.style.visibility =
 
 
             if (
-                button.offsetParent === null
+                button.offsetParent === null ||
+                isInChatColumn(button)
             ) {
                 continue;
             }
@@ -15264,6 +15395,27 @@ dashboardButton.style.visibility =
         }
 
 
+        // Mode cinéma, reconnu directement : le bouton va à gauche
+        // de la roue dentée du tchat, ou se cache si elle n'est pas
+        // à l'écran (tchat replié).
+        if (isTheatreMode()) {
+
+            if (!placePlayerUIInTheatre()) {
+
+                dashboardButton.style.visibility =
+                    'hidden';
+
+                if (dashboardVisible) {
+                    hideDashboard();
+                }
+
+            }
+
+            return;
+
+        }
+
+
     var followButton =
         findFollowButton();
 
@@ -15298,11 +15450,19 @@ dashboardButton.style.visibility =
 
         if (followButtonOverVideo(followButton, video)) {
 
-            dashboardButton.style.visibility =
-                'hidden';
+            // Mode cinéma : la ligne du bouton Suivre passe sur
+            // l'image. Le bouton se range alors à gauche de la roue
+            // dentée du tchat ; sans elle (tchat replié, plein
+            // écran), il se cache.
+            if (!placePlayerUIInTheatre()) {
 
-            if (dashboardVisible) {
-                hideDashboard();
+                dashboardButton.style.visibility =
+                    'hidden';
+
+                if (dashboardVisible) {
+                    hideDashboard();
+                }
+
             }
 
             return;
@@ -15426,6 +15586,96 @@ dashboardButton.style.visibility =
                 ) + 'px';
 
         }
+
+    }
+
+
+    // Place le bouton (et le menu s'il est ouvert) à gauche du
+    // bouton des réglages du tchat. Renvoie false si ce bouton n'est
+    // pas à l'écran. Recalculé à chaque passage de positionPlayerUI,
+    // donc il suit les redimensionnements de la fenêtre.
+    function placePlayerUIInTheatre() {
+
+        var anchor = null;
+
+        try {
+
+            var found = document.querySelectorAll(
+                '[data-a-target="chat-settings"],' +
+                'button[aria-label="Paramètres du chat"],' +
+                'button[aria-label="Chat settings"],' +
+                'button[aria-label="Chat Settings"]'
+            );
+
+            for (var i = 0; i < found.length; i++) {
+
+                var box = found[i].getBoundingClientRect();
+
+                if (
+                    found[i].offsetParent !== null &&
+                    box.width > 0 &&
+                    box.height > 0 &&
+                    box.right <= window.innerWidth + 1 &&
+                    box.bottom <= window.innerHeight + 1
+                ) {
+
+                    anchor = box;
+
+                    break;
+
+                }
+
+            }
+
+        } catch (e) {}
+
+        if (!anchor) {
+            return false;
+        }
+
+        dashboardButton.style.visibility = 'visible';
+
+        dashboardButton.style.position = 'fixed';
+
+        dashboardButton.style.bottom = '';
+
+        var buttonWidth = dashboardButton.offsetWidth || 32;
+
+        var buttonLeft = anchor.left - buttonWidth - 6;
+
+        var buttonTop = anchor.top + (anchor.height - 32) / 2;
+
+        dashboardButton.style.left = buttonLeft + 'px';
+
+        dashboardButton.style.top = buttonTop + 'px';
+
+        if (dashboardVisible) {
+
+            // Tout en bas à droite de l'écran : le menu s'ouvre vers
+            // le haut, bord droit calé sur le bouton, sans jamais
+            // sortir de l'écran.
+            var menuWidth = dashboard.offsetWidth || 340;
+            var menuHeight = dashboard.offsetHeight || 470;
+
+            var menuLeft = Math.max(
+                8,
+                Math.min(
+                    buttonLeft + buttonWidth - menuWidth,
+                    window.innerWidth - menuWidth - 8
+                )
+            );
+
+            var menuTop = Math.max(8, buttonTop - menuHeight - 8);
+
+            dashboard.style.position = 'fixed';
+
+            dashboard.style.left = menuLeft + 'px';
+
+            dashboard.style.top = menuTop + 'px';
+
+        }
+
+        return true;
 
     }
 
